@@ -25,7 +25,8 @@ export type OwnerScope =
   | { readonly kind: 'client'; readonly agencyId: string; readonly clientId: string }
   | { readonly kind: 'workspace'; readonly agencyId: string; readonly clientId: string; readonly workspaceId: string }
   | { readonly kind: 'goal'; readonly agencyId: string; readonly clientId: string; readonly workspaceId: string | null; readonly goalId: string }
-  | { readonly kind: 'playbook'; readonly agencyId: string; readonly clientId: string | null; readonly goalId: string | null; readonly playbookId: string };
+  | { readonly kind: 'playbook'; readonly agencyId: string; readonly clientId: string | null; readonly goalId: string | null; readonly playbookId: string }
+  | { readonly kind: 'workflow'; readonly agencyId: string; readonly clientId: string; readonly workspaceId: string; readonly workflowId: string };
 
 export interface PipelineContext<P extends Record<string, string>> {
   readonly request: RequestContext;

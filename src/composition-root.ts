@@ -58,6 +58,19 @@
  *     workflow/deployment/execution engine is wired (architecture.md §8:
  *     Deployment references immutable Playbook Versions and does not
  *     mutate them — /deployments is a later Work Item).
+ *
+ * MKT-008 additions:
+ *   - the /workflows module is constructed here (dependency matrix subset:
+ *     /workflows ──→ /workspaces, /playbooks) owning the Workflow
+ *     DEFINITION sub-authority (WF-001): Workspace-scoped Workflow
+ *     identity with server-derived Client/Agency ownership, the versioned
+ *     typed graph definitions with their schemas and declarative policy
+ *     blocks, the exhaustive graph validation and the
+ *     immutable-after-activation lifecycle. NO workflow-instance state
+ *     machine, NO runtime, NO execution or deployment authority is wired
+ *     (architecture.md §10/§11 — the instance machine is MKT-009,
+ *     Executions are /executions MKT-010, deployment binding is
+ *     /deployments MKT-040).
  */
 
 import fs from 'node:fs';
@@ -96,6 +109,7 @@ import { createCredentialsModule } from './modules/credentials/public.ts';
 import { createAuditModule } from './modules/audit/public.ts';
 import { createGoalsModule } from './modules/goals/public.ts';
 import { createPlaybooksModule } from './modules/playbooks/public.ts';
+import { createWorkflowsModule } from './modules/workflows/public.ts';
 import type { ApplicationModules } from './api/application.ts';
 
 export interface AppOptions {
@@ -180,7 +194,9 @@ function buildCore(config: AppConfig, options: AppOptions): Core {
   // /clients → /agencies, /auth; /workspaces → /clients; /credentials and
   // /audit import no other module — they take platform ports + plain data;
   // /goals → /clients, /workspaces; /playbooks → /agencies, /clients,
-  // /goals).
+  // /goals; /workflows → /workspaces, /playbooks — the MKT-008 definition
+  // sub-authority: the Workspace ownership chain resolves server-side and
+  // the Playbook provenance link pins explicit playbook version ids).
   const users = createUsersModule({ db, clock, ids });
   const auth = createAuthModule({
     db,
@@ -196,6 +212,7 @@ function buildCore(config: AppConfig, options: AppOptions): Core {
   const audit = createAuditModule({ db, clock, ids });
   const goals = createGoalsModule({ db, clock, ids, clients, workspaces });
   const playbooks = createPlaybooksModule({ db, clock, ids, agencies, clients, goals });
+  const workflows = createWorkflowsModule({ db, clock, ids, workspaces, playbooks });
 
   // Authentication order: user sessions first, then the internal service
   // token. Every path fails closed (CompositeAuthenticator).
@@ -222,7 +239,7 @@ function buildCore(config: AppConfig, options: AppOptions): Core {
         metrics,
       },
     },
-    modules: { users, auth, agencies, clients, workspaces, credentials, audit, goals, playbooks },
+    modules: { users, auth, agencies, clients, workspaces, credentials, audit, goals, playbooks, workflows },
   };
 }
 

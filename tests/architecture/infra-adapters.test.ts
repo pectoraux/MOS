@@ -410,6 +410,8 @@ test('MKT-005: migrations 005/006 exist with exactly the expected numbering (no 
     '007_goals.sql',
     // MKT-007 appends the playbooks migration (008).
     '008_playbooks.sql',
+    // MKT-008 appends the workflows migration (009).
+    '009_workflows.sql',
   ]);
   // The object-store fs/memory/s3 adapter dirs each hold exactly one implementation.
   for (const dir of ['cache', 'locking', 'objects', 'secrets']) {

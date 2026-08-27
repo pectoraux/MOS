@@ -40,8 +40,10 @@ export function auditActor(principal: Principal): string {
  * Server-derived tenant scope fields from the pipeline OwnerScope: the
  * agency is carried by every scoped owner; the client by client/workspace/
  * goal owners (and by client-scoped playbooks); the workspace by
- * workspace/goal owners. Playbooks carry no workspace scope (the frozen
- * ownership matrix scopes a Playbook to an Agency or a Client).
+ * workspace/goal/workflow owners. Playbooks carry no workspace scope (the
+ * frozen ownership matrix scopes a Playbook to an Agency or a Client);
+ * workflows are Workspace-scoped (the scope chain ends
+ * Agency → Client → Workspace → Workflow).
  */
 function ownerScopeAuditFields(owner: OwnerScope): {
   agencyId: string | null;
@@ -58,9 +60,17 @@ function ownerScopeAuditFields(owner: OwnerScope): {
         ? owner.clientId
         : owner.kind === 'playbook'
           ? owner.clientId
-          : null,
+          : owner.kind === 'workflow'
+            ? owner.clientId
+            : null,
     workspaceId:
-      owner.kind === 'workspace' ? owner.workspaceId : owner.kind === 'goal' ? owner.workspaceId : null,
+      owner.kind === 'workspace'
+        ? owner.workspaceId
+        : owner.kind === 'goal'
+          ? owner.workspaceId
+          : owner.kind === 'workflow'
+            ? owner.workspaceId
+            : null,
   };
 }
 
