@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    name: lint / typecheck / architecture / tests (incl. real-PostgreSQL integration)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint (eslint)
+        run: npm run lint
+
+      - name: Typecheck (tsc --noEmit)
+        run: npm run typecheck
+
+      - name: Static architecture check (PLAT-AC-01)
+        run: npm run arch:check
+
+      - name: Unit tests
+        run: npm run test:unit
+
+      - name: Architecture tests (negative fixtures)
+        run: npm run test:architecture
+
+      # Boots a real embedded PostgreSQL server (ICU 60 fetched automatically
+      # on hosts with newer ICU) and runs the API + worker as real subprocesses.
+      - name: Integration tests (real PostgreSQL, real process boundaries)
+        run: npm run test:integration
+
+      - name: Upload integration artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-logs
+          path: |
+            .test-deps/
+          retention-days: 3
+          if-no-files-found: ignore

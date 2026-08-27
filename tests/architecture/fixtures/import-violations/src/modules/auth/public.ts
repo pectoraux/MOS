@@ -1,0 +1,1 @@
+// frozen module boundary (fixture)
