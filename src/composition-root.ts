@@ -22,6 +22,11 @@
  *   - the /clients module is constructed here (dependency matrix:
  *     /clients ──→ /agencies, /auth) owning Client identity, Agency→Client
  *     ownership and canonical owner resolution.
+ *
+ * MKT-004 additions:
+ *   - the /workspaces module is constructed here (dependency matrix:
+ *     /workspaces ──→ /clients) owning Workspace identity, Client→Workspace
+ *     ownership and canonical owner resolution THROUGH /clients.
  */
 
 import { loadConfig, type AppConfig } from './platform/config/config.ts';
@@ -45,6 +50,7 @@ import { createUsersModule } from './modules/users/public.ts';
 import { createAuthModule } from './modules/auth/public.ts';
 import { createAgenciesModule } from './modules/agencies/public.ts';
 import { createClientsModule } from './modules/clients/public.ts';
+import { createWorkspacesModule } from './modules/workspaces/public.ts';
 import type { ApplicationModules } from './api/application.ts';
 
 export interface AppOptions {
@@ -81,7 +87,7 @@ function buildCore(config: AppConfig, options: AppOptions): Core {
   const metrics = new InMemoryMetrics();
 
   // Module wiring (dependency matrix: /auth → /users; /agencies → /users;
-  // /clients → /agencies, /auth).
+  // /clients → /agencies, /auth; /workspaces → /clients).
   const users = createUsersModule({ db, clock, ids });
   const auth = createAuthModule({
     db,
@@ -92,6 +98,7 @@ function buildCore(config: AppConfig, options: AppOptions): Core {
   });
   const agencies = createAgenciesModule({ db, clock, ids, users });
   const clients = createClientsModule({ db, clock, ids, agencies });
+  const workspaces = createWorkspacesModule({ db, clock, ids, clients });
 
   // Authentication order: user sessions first, then the internal service
   // token. Every path fails closed (CompositeAuthenticator).
@@ -115,7 +122,7 @@ function buildCore(config: AppConfig, options: AppOptions): Core {
         metrics,
       },
     },
-    modules: { users, auth, agencies, clients },
+    modules: { users, auth, agencies, clients, workspaces },
   };
 }
 

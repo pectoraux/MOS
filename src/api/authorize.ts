@@ -1,6 +1,6 @@
 /**
- * Server-side authorization helpers for identity routes (MKT-002) and Client
- * tenancy routes (MKT-003).
+ * Server-side authorization helpers for identity routes (MKT-002), Client
+ * tenancy routes (MKT-003) and Workspace boundary routes (MKT-004).
  *
  * Every check resolves the caller's authorization context FRESH from durable
  * state (users + agency memberships in PostgreSQL) — headers, body fields or
@@ -13,12 +13,21 @@
  * another Agency is indistinguishable from an unknown identifier (no
  * existence/traversal oracle, TENANT-AC-04). Intra-tenant failures (suspended
  * membership, wrong role) are 403s exactly like /agencies.
+ *
+ * MKT-004 (issue #11): Workspace is an organizational boundary inside one
+ * Client — the SAME hard-boundary posture applies one level deeper. A
+ * Workspace identifier is never an authorization credential (MKT-004-AC-02);
+ * a foreign Workspace (owned by a Client of another Agency) is
+ * indistinguishable from an unknown one (TENANT-AC-05), and the check
+ * authorizes against the agency that owns the workspace's CLIENT — resolved
+ * canonically BEFORE any dependent Workspace traversal.
  */
 
 import { ForbiddenError, NotFoundError } from '../platform/errors/errors.ts';
 import type { Principal } from '../platform/http/auth/contract.ts';
 import type { AgencyRoleKey, AuthorizationContext } from '../modules/agencies/public.ts';
 import type { ClientOwnerContext } from '../modules/clients/public.ts';
+import type { WorkspaceOwnerContext } from '../modules/workspaces/public.ts';
 import type { ApplicationModules } from './application.ts';
 
 /**
@@ -140,6 +149,68 @@ export async function requireClientAccess(
   }
   if (membership.membershipStatus !== 'active') {
     throw new ForbiddenError('Active membership in the client agency required');
+  }
+  if (roles !== undefined && !roles.includes(membership.role)) {
+    throw new ForbiddenError('This operation requires a different agency role');
+  }
+  return ownership;
+}
+
+/**
+ * Workspace-scoped access check (issue #11 MKT-004-AC-02/03, TENANT-AC-05).
+ *
+ * Step 1 resolves the CANONICAL Workspace ownership from durable state
+ * (workspace row → owning Client via /clients resolveClientOwnership → owning
+ * Agency) BEFORE anything else — a deleted workspace tombstone, a deleted
+ * Client tombstone or an unknown identifier is a uniform 404, all
+ * indistinguishable. Step 2 authorizes the caller against the agency that
+ * OWNS the workspace's Client, using the SAME durable membership authority as
+ * requireClientAccess (no second authorization authority, MKT-004-AC-08):
+ *
+ *   - service principal and platform administrators pass;
+ *   - a caller with NO membership in the owning agency gets the SAME 404 as
+ *     for an unknown Workspace — a foreign Workspace identifier is not a
+ *     traversal/existence oracle (TENANT-AC-05, security-threat-model
+ *     "Cross-tenant traversal": negative tests using two Clients);
+ *   - a suspended (disabled) membership or disabled identity never
+ *     authorizes (403);
+ *   - `roles` optionally restricts to specific agency roles (403 otherwise).
+ *
+ * Returns the canonical owner context the operation is scoped to. A
+ * Workspace ID is NEVER itself an authorization credential — it only selects
+ * WHICH durable ownership chain gets resolved.
+ */
+export async function requireWorkspaceAccess(
+  modules: ApplicationModules,
+  principal: Principal,
+  workspaceId: string,
+  roles?: ReadonlyArray<AgencyRoleKey>,
+): Promise<WorkspaceOwnerContext> {
+  const ownership = await modules.workspaces.resolveWorkspaceOwnership(workspaceId);
+  if (ownership === null) {
+    throw new NotFoundError('workspace', workspaceId);
+  }
+
+  if (principal.kind === 'service') return ownership;
+
+  const context = await resolveContext(modules, principal);
+  if (context === null || context.principal.status !== 'active') {
+    throw new ForbiddenError('Active user identity required');
+  }
+  if (context.platformRoles.includes('platform_administrator')) return ownership;
+
+  const membership = context.memberships.find(
+    (entry) => entry.agencyId === ownership.clientOwnership.client.agencyId,
+  );
+  if (membership === undefined) {
+    // Hard boundary one level deeper: not a member of the agency owning the
+    // workspace's CLIENT → indistinguishable from an unknown Workspace
+    // (uniform 404, no cross-tenant oracle; rejection BEFORE any dependent
+    // traversal — issue #11 MKT-004-AC-03).
+    throw new NotFoundError('workspace', workspaceId);
+  }
+  if (membership.membershipStatus !== 'active') {
+    throw new ForbiddenError('Active membership in the workspace client agency required');
   }
   if (roles !== undefined && !roles.includes(membership.role)) {
     throw new ForbiddenError('This operation requires a different agency role');
