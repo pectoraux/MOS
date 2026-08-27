@@ -24,7 +24,7 @@ import {
   jsonResponse,
   type OwnerScope,
 } from '../platform/http/pipeline.ts';
-import { Router } from '../platform/http/router.ts';
+import type { Router } from '../platform/http/router.ts';
 import { currentCorrelation } from '../platform/observability/correlation.ts';
 import { validateObject, optionalString, stringField, recordField, optionalInt } from '../platform/http/validation.ts';
 import type { JobRecord } from '../platform/queue/contract.ts';
@@ -57,8 +57,7 @@ const FORBIDDEN_AUTHORITY_FIELDS = [
   'claimedBy',
 ] as const;
 
-export function buildPlatformRouter(services: AppServices): Router {
-  const router = new Router();
+export function registerPlatformRoutes(router: Router, services: AppServices): void {
   const logger = services.observability.loggerFactory.forModule('platform.api');
 
   // Liveness (unauthenticated by design: exposes no state).
@@ -88,7 +87,8 @@ export function buildPlatformRouter(services: AppServices): Router {
 
       authorize: async (ctx) => {
         // Fail-closed boundary convention: only service principals may submit
-        // platform operations; user principals arrive with MKT-002.
+        // platform operations; user principals use the identity routes
+        // (MKT-002) — this stays a machine-to-machine surface.
         if (ctx.principal.kind !== 'service') {
           throw new NotFoundError('route', ctx.request.path);
         }
@@ -182,8 +182,6 @@ export function buildPlatformRouter(services: AppServices): Router {
       respond: (ctx) => jsonResponse(200, serializeOperation(ctx.result)),
     }),
   );
-
-  return router;
 }
 
 export function serializeOperation(job: JobRecord): Record<string, unknown> {

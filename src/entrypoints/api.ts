@@ -1,18 +1,21 @@
 /**
  * API entrypoint: config → composition root → migrations → HTTP server.
  * Explicit config, graceful shutdown (SIGTERM/SIGINT).
+ *
+ * MKT-002: bootstraps the full application (platform services + identity
+ * modules incl. the optional configured platform administrator).
  */
 
-import { bootstrapApp } from '../composition-root.ts';
-import { buildPlatformRouter } from '../api/platform-routes.ts';
+import { bootstrapApplication } from '../composition-root.ts';
+import { buildApiRouter } from '../api/routes.ts';
 import { createHttpServer } from '../platform/http/server.ts';
 import { toAppError } from '../platform/errors/errors.ts';
 
 async function main(): Promise<void> {
-  const services = await bootstrapApp();
+  const { services, modules } = await bootstrapApplication();
   const logger = services.observability.loggerFactory.forModule('platform.http');
 
-  const router = buildPlatformRouter(services);
+  const router = buildApiRouter(services, modules);
   const server = createHttpServer({
     router,
     logger,
