@@ -11,16 +11,21 @@ Read, in this order:
 3. `spec/architecture.md`
 4. `spec/architecture-lock.md`
 5. `spec/implementation-contract.md`
-6. Every `spec/*-v1.2.md` or `spec/*-v1.2-addendum.md` document listed by the frozen manifest
+6. every listed `spec/*-v1.2*` and `spec/*-v1.3*` override/addendum document
 7. `spec/state-machines.md`
 8. `spec/requirements.md`
-9. `spec/work-items.md`
-10. `spec/dependency-graph.md`
-11. `spec/traceability-matrix.md`
-12. `spec/work-item-matrix.md`
-13. `spec/module-dependency-matrix.md`
-14. `spec/security-threat-model.md`
-15. The specific Work Item's required acceptance criteria and out-of-scope definition
+9. the relevant `spec/*-v1.3.md` requirement addendum
+10. `spec/work-items.md`
+11. `spec/work-item-v1.3-overrides.md` when relevant
+12. `spec/dependency-graph.md`
+13. `spec/dependency-graph-v1.3.md` when relevant
+14. `spec/traceability-matrix.md`
+15. `spec/traceability-v1.3.md` when relevant
+16. `spec/work-item-matrix.md`
+17. `spec/module-dependency-matrix.md`
+18. `spec/security-threat-model.md`
+19. `spec/adr/*`
+20. the specific Work Item's complete Work Order
 
 Do not infer missing architectural rules from prompts, conversations, prior model output, or implementation convenience.
 
@@ -34,6 +39,8 @@ Do not infer missing architectural rules from prompts, conversations, prior mode
 - Client isolation is enforced server-side before dependent traversal or external access.
 - No provider SDK may leak into domain/application modules.
 - No extension, human, model, worker, or frontend may silently become an alternate authority.
+- Human Agents use the existing Job/Task/Execution authorities.
+- Domain Packs use the existing tenant, workflow, execution, evidence, credential, policy, AI-routing and Job authorities.
 
 ## Evidence rule
 
@@ -43,14 +50,23 @@ Never report an implementation as complete because an agent says it is complete.
 
 If implementation appears to require changing a frozen rule, stop and report an Architecture Change Request requirement. Do not modify the frozen architecture opportunistically.
 
-## v1.2 corrections
-
-The v1.2 sandbox and execution-reconciliation contracts supersede conflicting v1.1 wording. In particular:
+## v1.2 rules
 
 - Persistent sandboxes are Workspace-scoped and leased to Executions.
-- `execution_id` is not Sandbox ownership identity.
+- `execution_id` is never Sandbox identity.
 - `UNKNOWN` execution outcome is not success and is reconciled explicitly.
 - A non-idempotent side effect must not be blindly replayed after an unknown outcome.
+- Candidate-specific Job Offers are concurrency-safe claims.
+
+## v1.3 rules
+
+- `Human Agent` is the generic human execution participant; `Field Agent` is a specialization.
+- Human Agent specializations such as Chatter and Creator Manager do not create separate workflow/job/execution authorities.
+- Domain Packs are composition layers, not tenants and not execution engines.
+- Creator Operations is a Domain Pack, not a separate product/runtime.
+- Creator/fan/conversation/content/monetization data remains Client-scoped.
+- Creator-platform-specific APIs, SDKs, browser automation and scraping live behind Integration/Extension boundaries.
+- Creator Operations uses the common AI Router, Policy, Job, Execution, Evidence and Learning authorities.
 
 ## Expected implementation style
 
