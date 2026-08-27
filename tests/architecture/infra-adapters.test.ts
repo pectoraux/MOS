@@ -405,6 +405,9 @@ test('MKT-005: migrations 005/006 exist with exactly the expected numbering (no 
     '004_workspaces.sql',
     '005_credentials.sql',
     '006_audit_events.sql',
+    // MKT-006 appends the goals migration (007) — later Work Items keep
+    // extending this ordered, immutable list.
+    '007_goals.sql',
   ]);
   // The object-store fs/memory/s3 adapter dirs each hold exactly one implementation.
   for (const dir of ['cache', 'locking', 'objects', 'secrets']) {

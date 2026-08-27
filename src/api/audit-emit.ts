@@ -68,11 +68,19 @@ export async function recordMutationAudit(
 ): Promise<void> {
   const correlation = currentCorrelation();
   const scope =
-    owner.kind === 'agency' || owner.kind === 'client' || owner.kind === 'workspace'
+    owner.kind === 'agency' || owner.kind === 'client' || owner.kind === 'workspace' || owner.kind === 'goal'
       ? {
           agencyId: owner.agencyId,
-          clientId: owner.kind === 'client' || owner.kind === 'workspace' ? owner.clientId : null,
-          workspaceId: owner.kind === 'workspace' ? owner.workspaceId : null,
+          clientId:
+            owner.kind === 'client' || owner.kind === 'workspace' || owner.kind === 'goal'
+              ? owner.clientId
+              : null,
+          workspaceId:
+            owner.kind === 'workspace'
+              ? owner.workspaceId
+              : owner.kind === 'goal'
+                ? owner.workspaceId
+                : null,
         }
       : { agencyId: null, clientId: null, workspaceId: null };
 
