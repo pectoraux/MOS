@@ -27,6 +27,7 @@ import { ForbiddenError, NotFoundError } from '../platform/errors/errors.ts';
 import type { Principal } from '../platform/http/auth/contract.ts';
 import type { AgencyRoleKey, AuthorizationContext } from '../modules/agencies/public.ts';
 import type { ClientOwnerContext } from '../modules/clients/public.ts';
+import type { CredentialRecord } from '../modules/credentials/public.ts';
 import type { WorkspaceOwnerContext } from '../modules/workspaces/public.ts';
 import type { ApplicationModules } from './application.ts';
 
@@ -216,4 +217,59 @@ export async function requireWorkspaceAccess(
     throw new ForbiddenError('This operation requires a different agency role');
   }
   return ownership;
+}
+
+/**
+ * Credential-reference access check (MKT-005, issue #13 MKT-005-AC-05).
+ *
+ * Step 1 loads the durable credential reference: an unknown identifier OR a
+ * deleted tombstone is a uniform 404 (indistinguishable). Step 2 authorizes
+ * the caller against the agency that OWNS the reference — the SAME durable
+ * membership authority as every other scoped check (no second authorization
+ * authority):
+ *
+ *   - service principal and platform administrators pass;
+ *   - a caller with NO membership in the owning agency gets the SAME 404 as
+ *     for an unknown reference — a foreign credential id is not a
+ *     traversal/existence oracle (cross-tenant posture);
+ *   - a suspended membership or disabled identity never authorizes (403);
+ *   - `roles` optionally restricts to specific agency roles (403 otherwise).
+ *
+ * Material RESOLUTION is never routed: this check guards only reference
+ * management (create/list/read/lifecycle). The material itself resolves
+ * exclusively inside the /credentials module for authorized server-side
+ * execution contexts.
+ */
+export async function requireCredentialAccess(
+  modules: ApplicationModules,
+  principal: Principal,
+  credentialId: string,
+  roles?: ReadonlyArray<AgencyRoleKey>,
+): Promise<CredentialRecord> {
+  const reference = await modules.credentials.getCredentialReference(credentialId);
+  if (reference === null || reference.status === 'deleted') {
+    throw new NotFoundError('credential', credentialId);
+  }
+
+  if (principal.kind === 'service') return reference;
+
+  const context = await resolveContext(modules, principal);
+  if (context === null || context.principal.status !== 'active') {
+    throw new ForbiddenError('Active user identity required');
+  }
+  if (context.platformRoles.includes('platform_administrator')) return reference;
+
+  const membership = context.memberships.find((entry) => entry.agencyId === reference.agencyId);
+  if (membership === undefined) {
+    // Hard boundary: not a member of the OWNING agency → indistinguishable
+    // from an unknown reference (uniform 404, no cross-tenant oracle).
+    throw new NotFoundError('credential', credentialId);
+  }
+  if (membership.membershipStatus !== 'active') {
+    throw new ForbiddenError('Active membership in the credential agency required');
+  }
+  if (roles !== undefined && !roles.includes(membership.role)) {
+    throw new ForbiddenError('This operation requires a different agency role');
+  }
+  return reference;
 }

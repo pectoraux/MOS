@@ -24,6 +24,7 @@ export interface TestStackEnv {
   readonly databaseUrl: string;
   readonly internalApiToken: string;
   readonly objectStoreDir: string;
+  readonly secretsDir: string;
 }
 
 export interface SpawnedProcess {
@@ -85,6 +86,7 @@ function spawnNode(
       MOS_ENV: 'test',
       MOS_OBJECT_STORE: 'fs',
       MOS_OBJECT_STORE_DIR: env.objectStoreDir,
+      MOS_SECRETS_DIR: env.secretsDir,
       ...extraEnv,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -240,18 +242,20 @@ export interface IntegrationStack {
   readonly env: TestStackEnv;
 }
 
-/** Boots an isolated stack: fresh embedded PostgreSQL + migrations + object store dir. */
+/** Boots an isolated stack: fresh embedded PostgreSQL + migrations + object store dir + secret backend dir. */
 export async function bootStack(label: string): Promise<IntegrationStack> {
   const { startEmbeddedPg } = await import('./pg.ts');
   const pgHandle = await startEmbeddedPg(`mos_${label}`);
   await migrate(pgHandle.databaseUrl);
   const objectStoreDir = fs.mkdtempSync(path.join(os.tmpdir(), `mos-objects-${label}-`));
+  const secretsDir = fs.mkdtempSync(path.join(os.tmpdir(), `mos-secrets-${label}-`));
   return {
     pg: pgHandle,
     env: {
       databaseUrl: pgHandle.databaseUrl,
       internalApiToken: 'integration-test-token',
       objectStoreDir,
+      secretsDir,
     },
   };
 }
@@ -259,6 +263,7 @@ export async function bootStack(label: string): Promise<IntegrationStack> {
 export async function shutdownStack(stack: IntegrationStack): Promise<void> {
   await stack.pg.stop();
   fs.rmSync(stack.env.objectStoreDir, { recursive: true, force: true });
+  fs.rmSync(stack.env.secretsDir, { recursive: true, force: true });
 }
 
 export { repoRoot };

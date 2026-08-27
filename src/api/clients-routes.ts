@@ -29,6 +29,7 @@ import { currentCorrelation } from '../platform/observability/correlation.ts';
 import { validateObject, intField, optionalString, stringField } from '../platform/http/validation.ts';
 import type { ApplicationModules } from './application.ts';
 import { requireAgencyAccess, requireClientAccess } from './authorize.ts';
+import { recordMutationAudit } from './audit-emit.ts';
 import type { ClientOwnerContext, ClientRecord, ClientStatus } from '../modules/clients/public.ts';
 
 const CLIENT_STATUS_PATTERN = /^(active|disabled|deleted)$/;
@@ -148,12 +149,20 @@ export function registerClientsRoutes(
           actorId: ctx.principal.kind === 'user' ? ctx.principal.userId : null,
         });
       },
-      emit: (ctx) => {
+      emit: async (ctx) => {
         logger.info('clients.client.created', undefined, {
           client_id: ctx.result.clientId,
           agency_id: ctx.result.agencyId,
           client_slug: ctx.result.slug,
           correlation_id: currentCorrelation().correlationId,
+        });
+        await recordMutationAudit(modules, ctx.principal, ctx.owner, {
+          action: 'clients.client.created',
+          targetType: 'client',
+          targetId: ctx.result.clientId,
+          afterVersion: ctx.result.version,
+          idempotencyKey: `clients.client.created:${ctx.result.clientId}`,
+          details: { slug: ctx.result.slug },
         });
       },
       respond: (ctx) => jsonResponse(201, serializeClient(ctx.result)),
@@ -264,11 +273,19 @@ export function registerClientsRoutes(
           expectedVersion: body.version,
         });
       },
-      emit: (ctx) => {
+      emit: async (ctx) => {
         logger.info('clients.client.profile_updated', undefined, {
           client_id: ctx.result.clientId,
           agency_id: ctx.result.agencyId,
           correlation_id: currentCorrelation().correlationId,
+        });
+        await recordMutationAudit(modules, ctx.principal, ctx.owner, {
+          action: 'clients.client.profile_updated',
+          targetType: 'client',
+          targetId: ctx.result.clientId,
+          beforeVersion: ctx.result.version - 1,
+          afterVersion: ctx.result.version,
+          idempotencyKey: `clients.client.profile_updated:${ctx.result.clientId}:${ctx.result.version}`,
         });
       },
       respond: (ctx) => jsonResponse(200, serializeClient(ctx.result)),
@@ -307,12 +324,21 @@ export function registerClientsRoutes(
           expectedVersion: body.version,
         });
       },
-      emit: (ctx) => {
+      emit: async (ctx) => {
         logger.info('clients.client.status_changed', undefined, {
           client_id: ctx.result.clientId,
           agency_id: ctx.result.agencyId,
           status: ctx.result.status,
           correlation_id: currentCorrelation().correlationId,
+        });
+        await recordMutationAudit(modules, ctx.principal, ctx.owner, {
+          action: 'clients.client.status_changed',
+          targetType: 'client',
+          targetId: ctx.result.clientId,
+          beforeVersion: ctx.result.version - 1,
+          afterVersion: ctx.result.version,
+          idempotencyKey: `clients.client.status_changed:${ctx.result.clientId}:${ctx.result.version}`,
+          details: { status: ctx.result.status },
         });
       },
       respond: (ctx) => jsonResponse(200, serializeClient(ctx.result)),

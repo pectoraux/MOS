@@ -29,6 +29,8 @@ import { currentCorrelation } from '../platform/observability/correlation.ts';
 import { validateObject, optionalString, stringField, recordField, optionalInt } from '../platform/http/validation.ts';
 import type { JobRecord } from '../platform/queue/contract.ts';
 import { LONG_RUNNING_WORK_KIND } from '../workers/handlers.ts';
+import type { ApplicationModules } from './application.ts';
+import { recordMutationAudit } from './audit-emit.ts';
 
 type SubmitOperationsBody = {
   readonly handler: string;
@@ -57,7 +59,11 @@ const FORBIDDEN_AUTHORITY_FIELDS = [
   'claimedBy',
 ] as const;
 
-export function registerPlatformRoutes(router: Router, services: AppServices): void {
+export function registerPlatformRoutes(
+  router: Router,
+  services: AppServices,
+  modules: ApplicationModules,
+): void {
   const logger = services.observability.loggerFactory.forModule('platform.api');
 
   // Liveness (unauthenticated by design: exposes no state).
@@ -130,16 +136,28 @@ export function registerPlatformRoutes(router: Router, services: AppServices): v
         return submitResult;
       },
 
-      emit: (ctx) => {
-        // Material-mutation observability event (pipeline step 7). The
-        // append-only /audit authority (MKT-005) will persist audit events;
-        // this structured record already carries correlation identity.
+      emit: async (ctx) => {
+        // Material-mutation observability event (pipeline step 7) + the
+        // DURABLE audit event (MKT-005, AUD-001): the 202 response claims
+        // the operation was durably submitted — the audit row is persisted
+        // BEFORE that claim is made. Replays converge (same job id → same
+        // audit idempotency key).
         logger.info('operation.submitted', undefined, {
           operation_id: ctx.result.job.jobId,
           handler: ctx.result.job.handlerKind,
           replayed: ctx.result.replayed,
           submitted_by: ctx.result.job.submittedBy,
           correlation_id: ctx.result.job.correlationId,
+        });
+        await recordMutationAudit(modules, ctx.principal, ctx.owner, {
+          action: 'platform.operation.submitted',
+          targetType: 'platform_operation',
+          targetId: ctx.result.job.jobId,
+          idempotencyKey: `platform.operation.submitted:${ctx.result.job.jobId}`,
+          details: {
+            handler: ctx.result.job.handlerKind,
+            replayed: ctx.result.replayed,
+          },
         });
       },
 

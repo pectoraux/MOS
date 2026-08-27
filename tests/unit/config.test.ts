@@ -101,7 +101,9 @@ test('non-postgres MOS_DATABASE_URL fails with a ConfigError', () => {
 test('invalid enum values fail with a ConfigError listing allowed values', () => {
   assertConfigProblem({ MOS_DATABASE_URL: VALID_URL, MOS_LOG_LEVEL: 'verbose' }, 'MOS_LOG_LEVEL must be one of');
   assertConfigProblem({ MOS_DATABASE_URL: VALID_URL, MOS_ENV: 'staging' }, 'MOS_ENV must be one of');
-  assertConfigProblem({ MOS_DATABASE_URL: VALID_URL, MOS_OBJECT_STORE: 's3' }, 'MOS_OBJECT_STORE must be one of');
+  // 's3' became a VALID object-store kind in MKT-005; a genuinely unknown
+  // kind still fails the enum check.
+  assertConfigProblem({ MOS_DATABASE_URL: VALID_URL, MOS_OBJECT_STORE: 'azure' }, 'MOS_OBJECT_STORE must be one of');
 });
 
 test('invalid integers fail with a ConfigError', () => {
@@ -283,4 +285,72 @@ test('loadConfig never reads process.env when an env object is passed', () => {
       else process.env[key] = saved[index];
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// MKT-005: production infrastructure adapter configuration (issue #13).
+// ---------------------------------------------------------------------------
+
+const VALID_S3 = {
+  MOS_S3_ENDPOINT: 'http://127.0.0.1:9000',
+  MOS_S3_BUCKET: 'mos-objects',
+  MOS_S3_ACCESS_KEY_ID: 'minioadmin',
+  MOS_S3_SECRET_ACCESS_KEY: 'minioadmin-secret',
+} as const;
+
+test('MKT-005: s3 object store requires every S3 setting (complete-or-absent, fail fast)', () => {
+  // Choosing 's3' without the required settings must abort startup.
+  assertConfigProblem(
+    { MOS_DATABASE_URL: VALID_URL, MOS_OBJECT_STORE: 's3' },
+    'MOS_OBJECT_STORE=s3 requires MOS_S3_ENDPOINT, MOS_S3_BUCKET, MOS_S3_ACCESS_KEY_ID, MOS_S3_SECRET_ACCESS_KEY to be set',
+  );
+  assertConfigProblem(
+    { MOS_DATABASE_URL: VALID_URL, MOS_OBJECT_STORE: 's3', ...VALID_S3, MOS_S3_ENDPOINT: 'ftp://nope' },
+    'MOS_S3_ENDPOINT must be an http:// or https:// URL',
+  );
+  assertConfigProblem(
+    { MOS_DATABASE_URL: VALID_URL, MOS_OBJECT_STORE: 's3', ...VALID_S3, MOS_S3_BUCKET: 'Invalid_Bucket!' },
+    'MOS_S3_BUCKET must be a valid S3 bucket name',
+  );
+
+  // Complete S3 configuration parses with documented defaults.
+  const config = loadConfig({ MOS_DATABASE_URL: VALID_URL, MOS_OBJECT_STORE: 's3', ...VALID_S3 });
+  assert.equal(config.objectStore, 's3');
+  assert.equal(config.s3?.region, 'us-east-1');
+  assert.equal(config.s3?.pathStyle, true);
+  assert.equal(config.s3?.requestTimeoutMs, 10_000);
+
+  // Non-S3 stores ignore S3 settings entirely (s3 === null).
+  const memory = loadConfig({ MOS_DATABASE_URL: VALID_URL });
+  assert.equal(memory.s3, null);
+});
+
+test('MKT-005: MOS_REDIS_URL parses redis:// and rediss:// endpoints; empty means no backend', () => {
+  const none = loadConfig({ MOS_DATABASE_URL: VALID_URL });
+  assert.equal(none.redis, null); // degenerate cache + fail-closed locks wired
+
+  const plain = loadConfig({ MOS_DATABASE_URL: VALID_URL, MOS_REDIS_URL: 'redis://127.0.0.1:6399' });
+  assert.equal(plain.redis?.host, '127.0.0.1');
+  assert.equal(plain.redis?.port, 6399);
+  assert.equal(plain.redis?.secure, false);
+  assert.equal(plain.redis?.password, '');
+
+  const withAuth = loadConfig({ MOS_DATABASE_URL: VALID_URL, MOS_REDIS_URL: 'rediss://cache:pw@redis.internal:6380/1' });
+  assert.equal(withAuth.redis?.secure, true);
+  assert.equal(withAuth.redis?.username, 'cache');
+  assert.equal(withAuth.redis?.password, 'pw');
+
+  const defaultPort = loadConfig({ MOS_DATABASE_URL: VALID_URL, MOS_REDIS_URL: 'redis://redis.internal' });
+  assert.equal(defaultPort.redis?.port, 6379);
+
+  assertConfigProblem({ MOS_DATABASE_URL: VALID_URL, MOS_REDIS_URL: 'postgres://nope' }, 'MOS_REDIS_URL must use the redis:// or rediss:// scheme');
+  // An unparseable port makes the whole URL invalid (URL constructor rejects it).
+  assertConfigProblem({ MOS_DATABASE_URL: VALID_URL, MOS_REDIS_URL: 'redis://host:notaport' }, 'MOS_REDIS_URL must be a valid redis:// or rediss:// URL');
+  assertConfigProblem({ MOS_DATABASE_URL: VALID_URL, MOS_REDIS_URL: 'redis://host:6379/notadb' }, 'MOS_REDIS_URL path component must be a numeric database index');
+});
+
+test('MKT-005: secrets dir setting rejects blank values', () => {
+  assertConfigProblem({ MOS_DATABASE_URL: VALID_URL, MOS_SECRETS_DIR: '   ' }, 'MOS_SECRETS_DIR must not be blank');
+  const config = loadConfig({ MOS_DATABASE_URL: VALID_URL });
+  assert.equal(config.secretsDir, './var/secrets');
 });

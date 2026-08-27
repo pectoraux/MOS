@@ -21,6 +21,7 @@ import type { AppServices } from '../platform/app-services.ts';
 import type { Router } from '../platform/http/router.ts';
 import { validateObject, stringField } from '../platform/http/validation.ts';
 import type { ApplicationModules } from './application.ts';
+import { recordMutationAudit } from './audit-emit.ts';
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -65,15 +66,54 @@ export function registerAuthRoutes(
     // Steps 5–6 (derive + execute): the module verifies the credential
     // against the durable auth store and opens the session. Failures are a
     // uniform 401 (no account enumeration).
-    const credential = await modules.auth.login({ email: body.email, password: body.password });
+    let credential;
+    try {
+      credential = await modules.auth.login({ email: body.email, password: body.password });
+    } catch (error) {
+      // Material AUTHORIZATION failure event (AUD-001): login attempts are
+      // auditable security events. Best-effort with a loud log on audit
+      // failure — the original 401 must not be masked (a failed login makes
+      // no completion claim).
+      try {
+        await recordMutationAudit(modules, { kind: 'anonymous' }, { kind: 'platform' }, {
+          action: 'auth.login.failed',
+          targetType: 'user_email',
+          targetId: body.email,
+          result: 'failed',
+          idempotencyKey: null,
+          details: { reason: 'invalid_credentials' },
+        });
+      } catch (auditError) {
+        logger.error('audit.append.failed', String(auditError), {
+          action: 'auth.login.failed',
+          correlation_id: currentCorrelation().correlationId,
+        });
+      }
+      throw error;
+    }
 
-    // Step 7 (emit): material-mutation record with correlation identity.
+    // Step 7 (emit): material-mutation record with correlation identity,
+    // then the DURABLE audit event (AUD-001) — the session is only claimed
+    // (responded) after its audit row is persisted. Audit failure fails the
+    // request instead of silently losing the event.
     const correlation = currentCorrelation();
     logger.info('auth.session.created', undefined, {
       session_id: credential.sessionId,
       user_id: credential.userId,
       correlation_id: correlation.correlationId,
     });
+    await recordMutationAudit(
+      modules,
+      { kind: 'user', userId: credential.userId, email: body.email, displayName: body.email },
+      { kind: 'platform' },
+      {
+        action: 'auth.login.succeeded',
+        targetType: 'user',
+        targetId: credential.userId,
+        idempotencyKey: null,
+        details: { sessionId: credential.sessionId },
+      },
+    );
 
     // Step 8 (respond): the raw token is shown exactly this once.
     return jsonResponse(200, {
@@ -118,13 +158,21 @@ export function registerAuthRoutes(
         return { revoked: await modules.auth.revokeSessionByToken(token) };
       },
 
-      emit: (ctx) => {
+      emit: async (ctx) => {
         const correlation = currentCorrelation();
         logger.info('auth.session.revoked', undefined, {
           user_id: ctx.principal.kind === 'user' ? ctx.principal.userId : ctx.principal.kind === 'service' ? ctx.principal.id : null,
           revoked: ctx.result.revoked,
           correlation_id: correlation.correlationId,
         });
+        if (ctx.result.revoked) {
+          await recordMutationAudit(modules, ctx.principal, ctx.owner, {
+            action: 'auth.session.revoked',
+            targetType: 'user',
+            targetId: ctx.principal.kind === 'user' ? ctx.principal.userId : 'unknown',
+            idempotencyKey: null,
+          });
+        }
       },
 
       respond: (ctx) =>

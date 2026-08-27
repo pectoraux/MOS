@@ -28,6 +28,7 @@ import { currentCorrelation } from '../platform/observability/correlation.ts';
 import { validateObject, intField, optionalString, stringField } from '../platform/http/validation.ts';
 import type { ApplicationModules } from './application.ts';
 import { requireAgencyAccess, requirePlatformAdministrator } from './authorize.ts';
+import { recordMutationAudit } from './audit-emit.ts';
 import type {
   AgencyRecord,
   AgencyRoleKey,
@@ -176,12 +177,20 @@ export function registerAgenciesRoutes(
           actorId: ctx.principal.kind === 'user' ? ctx.principal.userId : null,
         });
       },
-      emit: (ctx) => {
+      emit: async (ctx) => {
         logger.info('agencies.agency.created', undefined, {
           agency_id: ctx.result.agency.agencyId,
           owner_membership_id: ctx.result.ownerMembership.membershipId,
           owner_user_id: ctx.result.ownerMembership.userId,
           correlation_id: currentCorrelation().correlationId,
+        });
+        await recordMutationAudit(modules, ctx.principal, ctx.owner, {
+          action: 'agencies.agency.created',
+          targetType: 'agency',
+          targetId: ctx.result.agency.agencyId,
+          afterVersion: ctx.result.agency.version,
+          idempotencyKey: `agencies.agency.created:${ctx.result.agency.agencyId}`,
+          details: { slug: ctx.result.agency.slug, ownerUserId: ctx.result.ownerMembership.userId },
         });
       },
       respond: (ctx) =>
@@ -245,10 +254,18 @@ export function registerAgenciesRoutes(
           expectedVersion: body.version,
         });
       },
-      emit: (ctx) => {
+      emit: async (ctx) => {
         logger.info('agencies.agency.profile_updated', undefined, {
           agency_id: ctx.result.agencyId,
           correlation_id: currentCorrelation().correlationId,
+        });
+        await recordMutationAudit(modules, ctx.principal, ctx.owner, {
+          action: 'agencies.agency.profile_updated',
+          targetType: 'agency',
+          targetId: ctx.result.agencyId,
+          beforeVersion: ctx.result.version - 1,
+          afterVersion: ctx.result.version,
+          idempotencyKey: `agencies.agency.profile_updated:${ctx.result.agencyId}:${ctx.result.version}`,
         });
       },
       respond: (ctx) => jsonResponse(200, serializeAgency(ctx.result)),
@@ -283,11 +300,20 @@ export function registerAgenciesRoutes(
           expectedVersion: body.version,
         });
       },
-      emit: (ctx) => {
+      emit: async (ctx) => {
         logger.info('agencies.agency.status_changed', undefined, {
           agency_id: ctx.result.agencyId,
           status: ctx.result.status,
           correlation_id: currentCorrelation().correlationId,
+        });
+        await recordMutationAudit(modules, ctx.principal, ctx.owner, {
+          action: 'agencies.agency.status_changed',
+          targetType: 'agency',
+          targetId: ctx.result.agencyId,
+          beforeVersion: ctx.result.version - 1,
+          afterVersion: ctx.result.version,
+          idempotencyKey: `agencies.agency.status_changed:${ctx.result.agencyId}:${ctx.result.version}`,
+          details: { status: ctx.result.status },
         });
       },
       respond: (ctx) => jsonResponse(200, serializeAgency(ctx.result)),
@@ -388,13 +414,21 @@ export function registerAgenciesRoutes(
           role: body.role,
         });
       },
-      emit: (ctx) => {
+      emit: async (ctx) => {
         logger.info('agencies.membership.created', undefined, {
           membership_id: ctx.result.membershipId,
           agency_id: ctx.result.agencyId,
           member_user_id: ctx.result.userId,
           role: ctx.result.role,
           correlation_id: currentCorrelation().correlationId,
+        });
+        await recordMutationAudit(modules, ctx.principal, ctx.owner, {
+          action: 'agencies.membership.created',
+          targetType: 'membership',
+          targetId: ctx.result.membershipId,
+          afterVersion: ctx.result.version,
+          idempotencyKey: `agencies.membership.created:${ctx.result.membershipId}`,
+          details: { memberUserId: ctx.result.userId, role: ctx.result.role },
         });
       },
       respond: (ctx) => jsonResponse(201, serializeMembership(ctx.result)),
@@ -456,7 +490,7 @@ export function registerAgenciesRoutes(
           expectedVersion: body.version,
         });
       },
-      emit: (ctx) => {
+      emit: async (ctx) => {
         logger.info('agencies.membership.updated', undefined, {
           membership_id: ctx.result.membershipId,
           agency_id: ctx.result.agencyId,
@@ -464,6 +498,15 @@ export function registerAgenciesRoutes(
           role: ctx.result.role,
           status: ctx.result.status,
           correlation_id: currentCorrelation().correlationId,
+        });
+        await recordMutationAudit(modules, ctx.principal, ctx.owner, {
+          action: 'agencies.membership.updated',
+          targetType: 'membership',
+          targetId: ctx.result.membershipId,
+          beforeVersion: ctx.result.version - 1,
+          afterVersion: ctx.result.version,
+          idempotencyKey: `agencies.membership.updated:${ctx.result.membershipId}:${ctx.result.version}`,
+          details: { role: ctx.result.role, status: ctx.result.status },
         });
       },
       respond: (ctx) => jsonResponse(200, serializeMembership(ctx.result)),

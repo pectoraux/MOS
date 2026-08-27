@@ -27,8 +27,24 @@
  *   - the /workspaces module is constructed here (dependency matrix:
  *     /workspaces ──→ /clients) owning Workspace identity, Client→Workspace
  *     ownership and canonical owner resolution THROUGH /clients.
+ *
+ * MKT-005 additions (issue #13 — extend existing authorities, never
+ * duplicate them):
+ *   - the object-store port gains the production S3-compatible adapter
+ *     (SigV4 over fetch — no SDK) next to the existing memory/fs adapters;
+ *     the MKT-001 ObjectStore contract is untouched;
+ *   - the advisory cache/lock capabilities are wired: a real Redis adapter
+ *     when MOS_REDIS_URL is configured, or the documented degenerate
+ *     adapters otherwise (NoCache + fail-closed UnavailableLock). The
+ *     durable queue authority REMAINS the PostgreSQL queue — Redis is never
+ *     wired as a queue or workflow authority;
+ *   - the secret backend (file-based SecretStore) is wired once and handed
+ *     to the /credentials module — the only consumer of material;
+ *   - the /credentials (CRED-001) and /audit (AUD-001) modules are
+ *     constructed here with platform ports only.
  */
 
+import fs from 'node:fs';
 import { loadConfig, type AppConfig } from './platform/config/config.ts';
 import { SystemClock } from './platform/clock/clock.ts';
 import { CryptoIdGenerator } from './platform/ids/ids.ts';
@@ -37,20 +53,31 @@ import { runMigrations } from './platform/db/migrate.ts';
 import { PgQueue } from './platform/queue/adapters/postgres/pg-queue.ts';
 import { MemoryObjectStore } from './platform/objects/adapters/memory/memory-object-store.ts';
 import { FsObjectStore } from './platform/objects/adapters/fs/fs-object-store.ts';
+import { S3ObjectStore } from './platform/objects/adapters/s3/s3-object-store.ts';
+import { RedisCache } from './platform/cache/adapters/redis/redis-cache.ts';
+import { NoCache } from './platform/cache/adapters/none/no-cache.ts';
+import { RedisLock } from './platform/locking/adapters/redis/redis-lock.ts';
+import { UnavailableLock } from './platform/locking/adapters/none/unavailable-lock.ts';
+import { FileSecretStore } from './platform/secrets/adapters/file/file-secret-store.ts';
 import { ConsoleSink } from './platform/observability/adapters/console/console-sink.ts';
 import { CompositeSink } from './platform/observability/adapters/composite/composite-sink.ts';
 import { createLoggerFactory } from './platform/observability/logger.ts';
 import { InMemoryMetrics } from './platform/observability/metrics.ts';
 import { InternalTokenAuthenticator } from './platform/http/auth/adapters/internal-token/internal-token-authenticator.ts';
 import { CompositeAuthenticator } from './platform/http/auth/adapters/composite/composite-authenticator.ts';
+import { ConfigError } from './platform/errors/errors.ts';
 import type { AppServices } from './platform/app-services.ts';
 import type { ObservabilitySink } from './platform/observability/contract.ts';
 import type { Logger } from './platform/observability/contract.ts';
+import type { CachePort } from './platform/cache/contract.ts';
+import type { LockPort } from './platform/locking/contract.ts';
 import { createUsersModule } from './modules/users/public.ts';
 import { createAuthModule } from './modules/auth/public.ts';
 import { createAgenciesModule } from './modules/agencies/public.ts';
 import { createClientsModule } from './modules/clients/public.ts';
 import { createWorkspacesModule } from './modules/workspaces/public.ts';
+import { createCredentialsModule } from './modules/credentials/public.ts';
+import { createAuditModule } from './modules/audit/public.ts';
 import type { ApplicationModules } from './api/application.ts';
 
 export interface AppOptions {
@@ -72,10 +99,55 @@ function buildCore(config: AppConfig, options: AppOptions): Core {
   const db = new PgDb(config.databaseUrl);
   const queue = new PgQueue(db, () => ids.newId());
 
+  // Object store: the MKT-001 port, now with the production S3-compatible
+  // adapter behind the SAME contract (wired here only — consumers unchanged).
   const objects =
-    config.objectStore === 'fs'
-      ? new FsObjectStore(config.objectStoreDir)
-      : new MemoryObjectStore();
+    config.objectStore === 's3'
+      ? new S3ObjectStore({
+          endpoint: config.s3!.endpoint,
+          region: config.s3!.region,
+          bucket: config.s3!.bucket,
+          accessKeyId: config.s3!.accessKeyId,
+          secretAccessKey: config.s3!.secretAccessKey,
+          pathStyle: config.s3!.pathStyle,
+          requestTimeoutMs: config.s3!.requestTimeoutMs,
+        })
+      : config.objectStore === 'fs'
+        ? new FsObjectStore(config.objectStoreDir)
+        : new MemoryObjectStore();
+
+  // Advisory cache/lock capabilities (MKT-005): a real Redis backend when
+  // configured; otherwise the documented degenerate adapters. PostgreSQL
+  // remains the authoritative system of record and durable queue authority
+  // — Redis is wired ONLY for advisory cache and advisory locks.
+  let cache: CachePort;
+  let locks: LockPort;
+  if (config.redis !== null) {
+    const redis = config.redis;
+    const shared = {
+      host: redis.host,
+      port: redis.port,
+      username: redis.username === '' ? undefined : redis.username,
+      password: redis.password === '' ? undefined : redis.password,
+      secure: redis.secure,
+      timeoutMs: config.redisTimeoutMs,
+    };
+    cache = new RedisCache({ ...shared, keyPrefix: 'mos:cache:' });
+    locks = new RedisLock({ ...shared, keyPrefix: 'mos:lock:' });
+  } else {
+    cache = new NoCache();
+    locks = new UnavailableLock();
+  }
+
+  // Secret backend: resolution-only file store (mounted-secret model).
+  // Fail fast when the backend directory is absent: a half-configured
+  // secret backend must abort startup, not silently fail at first resolve.
+  if (!fs.existsSync(config.secretsDir) || !fs.statSync(config.secretsDir).isDirectory()) {
+    throw new ConfigError('Secret backend directory does not exist', [
+      `MOS_SECRETS_DIR=${config.secretsDir}: create the directory and mount secret files as <handle>.secret`,
+    ]);
+  }
+  const secrets = new FileSecretStore({ dir: config.secretsDir });
 
   const primarySink = options.primarySink ?? new ConsoleSink();
   const sink =
@@ -87,7 +159,8 @@ function buildCore(config: AppConfig, options: AppOptions): Core {
   const metrics = new InMemoryMetrics();
 
   // Module wiring (dependency matrix: /auth → /users; /agencies → /users;
-  // /clients → /agencies, /auth; /workspaces → /clients).
+  // /clients → /agencies, /auth; /workspaces → /clients; /credentials and
+  // /audit import no other module — they take platform ports + plain data).
   const users = createUsersModule({ db, clock, ids });
   const auth = createAuthModule({
     db,
@@ -99,6 +172,8 @@ function buildCore(config: AppConfig, options: AppOptions): Core {
   const agencies = createAgenciesModule({ db, clock, ids, users });
   const clients = createClientsModule({ db, clock, ids, agencies });
   const workspaces = createWorkspacesModule({ db, clock, ids, clients });
+  const credentials = createCredentialsModule({ db, clock, ids, secrets });
+  const audit = createAuditModule({ db, clock, ids });
 
   // Authentication order: user sessions first, then the internal service
   // token. Every path fails closed (CompositeAuthenticator).
@@ -115,6 +190,9 @@ function buildCore(config: AppConfig, options: AppOptions): Core {
       db,
       queue,
       objects,
+      cache,
+      locks,
+      secrets,
       auth: authenticator,
       observability: {
         sink,
@@ -122,7 +200,7 @@ function buildCore(config: AppConfig, options: AppOptions): Core {
         metrics,
       },
     },
-    modules: { users, auth, agencies, clients, workspaces },
+    modules: { users, auth, agencies, clients, workspaces, credentials, audit },
   };
 }
 

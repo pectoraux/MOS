@@ -33,6 +33,7 @@ import { currentCorrelation } from '../platform/observability/correlation.ts';
 import { validateObject, intField, optionalString, stringField } from '../platform/http/validation.ts';
 import type { ApplicationModules } from './application.ts';
 import { requireClientAccess, requireWorkspaceAccess } from './authorize.ts';
+import { recordMutationAudit } from './audit-emit.ts';
 import type {
   WorkspaceOwnerContext,
   WorkspaceRecord,
@@ -182,12 +183,20 @@ export function registerWorkspacesRoutes(
           actorId: ctx.principal.kind === 'user' ? ctx.principal.userId : null,
         });
       },
-      emit: (ctx) => {
+      emit: async (ctx) => {
         logger.info('workspaces.workspace.created', undefined, {
           workspace_id: ctx.result.workspaceId,
           client_id: ctx.result.clientId,
           workspace_slug: ctx.result.slug,
           correlation_id: currentCorrelation().correlationId,
+        });
+        await recordMutationAudit(modules, ctx.principal, ctx.owner, {
+          action: 'workspaces.workspace.created',
+          targetType: 'workspace',
+          targetId: ctx.result.workspaceId,
+          afterVersion: ctx.result.version,
+          idempotencyKey: `workspaces.workspace.created:${ctx.result.workspaceId}`,
+          details: { slug: ctx.result.slug },
         });
       },
       respond: (ctx) => jsonResponse(201, serializeWorkspace(ctx.result)),
@@ -304,11 +313,19 @@ export function registerWorkspacesRoutes(
           expectedVersion: body.version,
         });
       },
-      emit: (ctx) => {
+      emit: async (ctx) => {
         logger.info('workspaces.workspace.profile_updated', undefined, {
           workspace_id: ctx.result.workspaceId,
           client_id: ctx.result.clientId,
           correlation_id: currentCorrelation().correlationId,
+        });
+        await recordMutationAudit(modules, ctx.principal, ctx.owner, {
+          action: 'workspaces.workspace.profile_updated',
+          targetType: 'workspace',
+          targetId: ctx.result.workspaceId,
+          beforeVersion: ctx.result.version - 1,
+          afterVersion: ctx.result.version,
+          idempotencyKey: `workspaces.workspace.profile_updated:${ctx.result.workspaceId}:${ctx.result.version}`,
         });
       },
       respond: (ctx) => jsonResponse(200, serializeWorkspace(ctx.result)),
@@ -347,12 +364,21 @@ export function registerWorkspacesRoutes(
           expectedVersion: body.version,
         });
       },
-      emit: (ctx) => {
+      emit: async (ctx) => {
         logger.info('workspaces.workspace.status_changed', undefined, {
           workspace_id: ctx.result.workspaceId,
           client_id: ctx.result.clientId,
           status: ctx.result.status,
           correlation_id: currentCorrelation().correlationId,
+        });
+        await recordMutationAudit(modules, ctx.principal, ctx.owner, {
+          action: 'workspaces.workspace.status_changed',
+          targetType: 'workspace',
+          targetId: ctx.result.workspaceId,
+          beforeVersion: ctx.result.version - 1,
+          afterVersion: ctx.result.version,
+          idempotencyKey: `workspaces.workspace.status_changed:${ctx.result.workspaceId}:${ctx.result.version}`,
+          details: { status: ctx.result.status },
         });
       },
       respond: (ctx) => jsonResponse(200, serializeWorkspace(ctx.result)),
