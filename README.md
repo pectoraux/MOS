@@ -1,14 +1,12 @@
 # MarketingOS
 
 **Status:** Architecture package FROZEN
-**Architecture Version:** 1.1
-**Purpose:** Define a provider-independent, evidence-driven, multi-tenant marketing operating system for agencies that coordinates software, AI, extensions, and human field agents around measurable acquisition goals.
+**Current Architecture Version:** 1.2
+**Previous Baseline:** 1.1
 
-## What MarketingOS is
+MarketingOS is a provider-independent, evidence-driven, multi-tenant Marketing Operating System for agencies. It coordinates deterministic software, AI capabilities, human field agents, and third-party extensions around measurable acquisition goals.
 
-MarketingOS is not an AI-agent wrapper, a reporting dashboard, a CRM replacement, or a generic agent builder. It is an operating system for customer-acquisition operations.
-
-The core loop is:
+## Core loop
 
 ```text
 Goal → Context → Evidence → Hypothesis → Workflow → Execution → Measurement → Learning
@@ -16,45 +14,21 @@ Goal → Context → Evidence → Hypothesis → Workflow → Execution → Meas
   └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The system supports four execution kinds inside one governed workflow model:
+## Implementation authority
 
-- deterministic software;
-- AI capabilities;
-- third-party extensions;
-- human execution, including platform field agents.
+The `spec/` tree is authoritative. The v1.1 documents remain the baseline architecture; Architecture Change Request 002 introduces the v1.2 corrections listed in the frozen manifest and the v1.2 override documents. When an override conflicts with v1.1 wording, the v1.2 override is authoritative.
 
-## Frozen repository layout
+Implementation agents MUST read `AGENTS.md` before any implementation work.
 
-```text
-MarketingOS/
-├── spec/
-│   ├── architecture.md
-│   ├── architecture-lock.md
-│   ├── requirements.md
-│   ├── work-items.md
-│   ├── dependency-graph.md
-│   ├── glossary.md
-│   ├── product-scope.md
-│   ├── tenant-runtime-model.md
-│   ├── ai-runtime-and-routing.md
-│   ├── evidence-and-experimentation.md
-│   ├── extension-model.md
-│   └── adr/
-├── docs/
-│   ├── architecture/
-│   └── handoff/
-└── .github/
-    └── pull_request_template.md
-```
+Implementation is intended to be driven through `pectoraux/WorkflowOS`. WorkflowOS remains a separate development-governance product and is not a MarketingOS runtime dependency.
 
-The `spec/` tree is authoritative. Implementation work must not change frozen architecture documents. Architectural changes require an Architecture Change Request and a new immutable architecture version.
+## v1.2 corrections that matter to implementation
 
-## Implementation governance
+- Persistent sandboxes are Workspace-scoped environments leased to Executions; they are not owned by a single Execution.
+- `execution_id` is never Sandbox identity.
+- External `UNKNOWN` execution outcomes are not success and require explicit reconciliation before a trusted terminal result can be established.
+- Human Job distribution uses candidate-specific Offers; exactly one acceptance may win unless the Job explicitly supports parallel staffing.
 
-Implementation is intended to be driven through the existing `pectoraux/WorkflowOS` process. WorkflowOS remains a separate development-governance product; MarketingOS does not embed or depend on WorkflowOS at runtime.
-
-The implementation unit is a Work Item. Work Items move through a deterministic lifecycle with explicit evidence and review. The MarketingOS repository does not permit an implementation agent to reinterpret the architecture or create parallel authorities.
-
-## Core architectural rule
+## Architectural rule
 
 > **AI is a replaceable reasoning layer. The system of record, evidence, policy, workflow state, experiments, and deterministic computation remain authoritative outside the model.**
