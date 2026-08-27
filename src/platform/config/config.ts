@@ -11,13 +11,30 @@
  * bootstrap platform administrator. The bootstrap credential is start-time
  * configuration only — it is never persisted as raw material; only the
  * scrypt verifier lands in the auth-owned credential store.
+ *
+ * MKT-005 additions: production infrastructure adapters — the S3-compatible
+ * object store (behind the MKT-001 ObjectStore port), the Redis cache/lock
+ * backend (advisory capabilities only; an empty MOS_REDIS_URL wires the
+ * documented degenerate adapters) and the secret backend directory (the
+ * file-backed SecretStore). S3 configuration is complete-or-absent: choosing
+ * 's3' without every required setting aborts startup (fail fast, never a
+ * half-configured production adapter).
  */
 
 import { ConfigError } from '../errors/errors.ts';
 
 export type LogLevelName = 'debug' | 'info' | 'warn' | 'error';
 export type EnvironmentName = 'dev' | 'test' | 'prod';
-export type ObjectStoreKind = 'memory' | 'fs';
+export type ObjectStoreKind = 'memory' | 'fs' | 's3';
+
+/** Parsed Redis endpoint (advisory cache/lock backend). */
+export interface RedisEndpoint {
+  readonly host: string;
+  readonly port: number;
+  readonly username: string;
+  readonly password: string;
+  readonly secure: boolean;
+}
 
 export interface AppConfig {
   /** Environment label. */
@@ -36,6 +53,22 @@ export interface AppConfig {
   readonly objectStore: ObjectStoreKind;
   /** Filesystem root for the fs object store. */
   readonly objectStoreDir: string;
+  /** S3-compatible object-storage settings (required together when objectStore === 's3'). */
+  readonly s3: {
+    readonly endpoint: string;
+    readonly region: string;
+    readonly bucket: string;
+    readonly accessKeyId: string;
+    readonly secretAccessKey: string;
+    readonly pathStyle: boolean;
+    readonly requestTimeoutMs: number;
+  } | null;
+  /** Redis endpoint for the ADVISORY cache/lock adapters; null = degenerate adapters. */
+  readonly redis: RedisEndpoint | null;
+  /** Per-command Redis timeout in milliseconds. */
+  readonly redisTimeoutMs: number;
+  /** Root directory of the file-backed secret store (mounted secrets). */
+  readonly secretsDir: string;
   /** Bearer token for the platform HTTP authenticator; empty = fail closed. */
   readonly internalApiToken: string;
   /** User session lifetime in milliseconds (MKT-002 /auth sessions). */
@@ -77,8 +110,16 @@ export function loadConfig(env: Env = process.env): AppConfig {
   const httpPort = readInt(env, 'MOS_HTTP_PORT', 8080, 0, 65535, problems);
   const httpMaxBodyBytes = readInt(env, 'MOS_HTTP_MAX_BODY_BYTES', 1_048_576, 1, 67_108_864, problems);
 
-  const objectStore = readEnum(env, 'MOS_OBJECT_STORE', ['memory', 'fs'], 'memory', problems);
+  const objectStore = readEnum(env, 'MOS_OBJECT_STORE', ['memory', 'fs', 's3'], 'memory', problems);
   const objectStoreDir = env['MOS_OBJECT_STORE_DIR'] ?? './var/objects';
+
+  const s3 = parseS3Config(env, objectStore, problems);
+  const redis = parseRedisEndpoint(env['MOS_REDIS_URL'] ?? '', problems);
+  const redisTimeoutMs = readInt(env, 'MOS_REDIS_TIMEOUT_MS', 2_000, 100, 60_000, problems);
+  const secretsDir = (env['MOS_SECRETS_DIR'] ?? './var/secrets').trim();
+  if (secretsDir === '') {
+    problems.push('MOS_SECRETS_DIR must not be blank when set');
+  }
 
   const internalApiToken = env['MOS_INTERNAL_API_TOKEN'] ?? '';
 
@@ -113,6 +154,10 @@ export function loadConfig(env: Env = process.env): AppConfig {
     logLevel,
     objectStore,
     objectStoreDir,
+    s3,
+    redis,
+    redisTimeoutMs,
+    secretsDir,
     internalApiToken,
     authSessionTtlMs,
     bootstrapAdminEmail,
@@ -157,4 +202,102 @@ function readInt(
     return fallback;
   }
   return parsed;
+}
+
+/** Parses and validates the S3 object-storage settings (MKT-005). */
+function parseS3Config(
+  env: Env,
+  objectStore: ObjectStoreKind,
+  problems: string[],
+): AppConfig['s3'] {
+  const raw = {
+    endpoint: env['MOS_S3_ENDPOINT'] ?? '',
+    region: env['MOS_S3_REGION'] ?? '',
+    bucket: env['MOS_S3_BUCKET'] ?? '',
+    accessKeyId: env['MOS_S3_ACCESS_KEY_ID'] ?? '',
+    secretAccessKey: env['MOS_S3_SECRET_ACCESS_KEY'] ?? '',
+    pathStyle: env['MOS_S3_PATH_STYLE'] ?? 'true',
+  };
+  const requestTimeoutMs = readInt(env, 'MOS_S3_TIMEOUT_MS', 10_000, 100, 300_000, problems);
+
+  if (objectStore !== 's3') {
+    // S3 settings are ignored for other stores, but half-configured S3 on an
+    // S3 store must fail fast — handled below. Here: nothing to validate.
+    return null;
+  }
+
+  const missing: string[] = [];
+  if (raw.endpoint === '') missing.push('MOS_S3_ENDPOINT');
+  if (raw.bucket === '') missing.push('MOS_S3_BUCKET');
+  if (raw.accessKeyId === '') missing.push('MOS_S3_ACCESS_KEY_ID');
+  if (raw.secretAccessKey === '') missing.push('MOS_S3_SECRET_ACCESS_KEY');
+  if (missing.length > 0) {
+    problems.push(`MOS_OBJECT_STORE=s3 requires ${missing.join(', ')} to be set`);
+    return null;
+  }
+  if (!/^https?:\/\//.test(raw.endpoint)) {
+    problems.push('MOS_S3_ENDPOINT must be an http:// or https:// URL');
+  }
+  if (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(raw.bucket)) {
+    problems.push('MOS_S3_BUCKET must be a valid S3 bucket name');
+  }
+  if (raw.pathStyle !== 'true' && raw.pathStyle !== 'false') {
+    problems.push("MOS_S3_PATH_STYLE must be 'true' or 'false'");
+    return null;
+  }
+
+  return {
+    endpoint: raw.endpoint,
+    region: raw.region === '' ? 'us-east-1' : raw.region,
+    bucket: raw.bucket,
+    accessKeyId: raw.accessKeyId,
+    secretAccessKey: raw.secretAccessKey,
+    pathStyle: raw.pathStyle === 'true',
+    requestTimeoutMs,
+  };
+}
+
+/**
+ * Parses MOS_REDIS_URL (redis://[:password@]host[:port][/db] or
+ * rediss:// for TLS). Empty means "no Redis backend" → degenerate cache and
+ * fail-closed lock adapters (documented port behavior).
+ */
+function parseRedisEndpoint(url: string, problems: string[]): AppConfig['redis'] {
+  if (url === '') return null;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    problems.push('MOS_REDIS_URL must be a valid redis:// or rediss:// URL');
+    return null;
+  }
+  if (parsed.protocol !== 'redis:' && parsed.protocol !== 'rediss:') {
+    problems.push('MOS_REDIS_URL must use the redis:// or rediss:// scheme');
+    return null;
+  }
+  const port = parsed.port === '' ? 6379 : Number.parseInt(parsed.port, 10);
+  if (parsed.hostname === '' || Number.isNaN(port) || port < 1 || port > 65535) {
+    problems.push('MOS_REDIS_URL must include a host and a valid port');
+    return null;
+  }
+  // Redis URLs encode the password in the userinfo (optionally user:pass).
+  const password = decodeURIComponent(parsed.password ?? '');
+  const username = parsed.username === '' ? '' : decodeURIComponent(parsed.username);
+  if (parsed.pathname !== '/' && parsed.pathname !== '') {
+    // A logical DB index is accepted syntactically but cache/lock keys are
+    // prefixed per deployment; selecting a non-default DB is unnecessary.
+    const db = parsed.pathname.replace(/^\//, '');
+    if (!/^\d+$/.test(db)) {
+      problems.push('MOS_REDIS_URL path component must be a numeric database index');
+      return null;
+    }
+  }
+  return {
+    host: parsed.hostname,
+    port,
+    username,
+    password,
+    secure: parsed.protocol === 'rediss:',
+  };
 }

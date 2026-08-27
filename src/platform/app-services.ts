@@ -6,6 +6,11 @@
  * adapters) so that api/, workers/ and modules/ never import infrastructure
  * implementations directly. Concrete wiring happens exclusively in
  * src/composition-root.ts (spec/module-dependency-matrix.md "Composition root").
+ *
+ * MKT-005 additions (issue #13): `cache` and `locks` expose the ADVISORY
+ * cache/lock capabilities (never authority — PostgreSQL remains the system
+ * of record and durable queue authority); `secrets` is the resolution-only
+ * secret backend behind the /credentials module's frozen boundary.
  */
 
 import type { AppConfig } from './config/config.ts';
@@ -16,6 +21,9 @@ import type { IdGenerator } from './ids/ids.ts';
 import type { JobQueue } from './queue/contract.ts';
 import type { LoggerFactory, Metrics, ObservabilitySink } from './observability/contract.ts';
 import type { ObjectStore } from './objects/contract.ts';
+import type { CachePort } from './cache/contract.ts';
+import type { LockPort } from './locking/contract.ts';
+import type { SecretStore } from './secrets/contract.ts';
 
 export interface AppServices {
   readonly config: AppConfig;
@@ -24,6 +32,12 @@ export interface AppServices {
   readonly db: Db;
   readonly queue: JobQueue;
   readonly objects: ObjectStore;
+  /** Advisory cache (MKT-005) — correctness never depends on it. */
+  readonly cache: CachePort;
+  /** Advisory distributed locks (MKT-005) — fail-closed when unavailable. */
+  readonly locks: LockPort;
+  /** Resolution-only secret backend (MKT-005, CRED-001) — used by /credentials. */
+  readonly secrets: SecretStore;
   readonly auth: RequestAuthenticator;
   readonly observability: {
     readonly sink: ObservabilitySink;

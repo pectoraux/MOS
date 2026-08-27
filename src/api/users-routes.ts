@@ -29,6 +29,7 @@ import { currentCorrelation } from '../platform/observability/correlation.ts';
 import { validateObject, intField, stringField } from '../platform/http/validation.ts';
 import type { ApplicationModules } from './application.ts';
 import { requirePlatformAdministrator } from './authorize.ts';
+import { recordMutationAudit } from './audit-emit.ts';
 import type { PlatformRoleKey, UserRecord } from '../modules/users/public.ts';
 import { PLATFORM_ROLE_KEYS } from '../modules/users/public.ts';
 import { MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH } from '../modules/auth/public.ts';
@@ -95,7 +96,7 @@ export function registerUsersRoutes(
         const body = ctx.validated as { email: string; displayName: string };
         return modules.users.createUser(body);
       },
-      emit: (ctx) => {
+      emit: async (ctx) => {
         logger.info('users.user.created', undefined, {
           user_id: ctx.result.userId,
           actor:
@@ -105,6 +106,13 @@ export function registerUsersRoutes(
               ? ctx.principal.userId
               : null,
           correlation_id: currentCorrelation().correlationId,
+        });
+        await recordMutationAudit(modules, ctx.principal, ctx.owner, {
+          action: 'users.user.created',
+          targetType: 'user',
+          targetId: ctx.result.userId,
+          afterVersion: ctx.result.version,
+          idempotencyKey: `users.user.created:${ctx.result.userId}`,
         });
       },
       respond: (ctx) => jsonResponse(201, serializeUser(ctx.result)),
@@ -167,10 +175,18 @@ export function registerUsersRoutes(
           expectedVersion: body.version,
         });
       },
-      emit: (ctx) => {
+      emit: async (ctx) => {
         logger.info('users.user.profile_updated', undefined, {
           user_id: ctx.result.userId,
           correlation_id: currentCorrelation().correlationId,
+        });
+        await recordMutationAudit(modules, ctx.principal, ctx.owner, {
+          action: 'users.user.profile_updated',
+          targetType: 'user',
+          targetId: ctx.result.userId,
+          beforeVersion: ctx.result.version - 1,
+          afterVersion: ctx.result.version,
+          idempotencyKey: `users.user.profile_updated:${ctx.result.userId}:${ctx.result.version}`,
         });
       },
       respond: (ctx) => jsonResponse(200, serializeUser(ctx.result)),
@@ -210,12 +226,21 @@ export function registerUsersRoutes(
           user.status === 'disabled' ? await modules.auth.revokeSessionsForUser(user.userId) : 0;
         return { user, revokedSessions };
       },
-      emit: (ctx) => {
+      emit: async (ctx) => {
         logger.info('users.user.status_changed', undefined, {
           user_id: ctx.result.user.userId,
           status: ctx.result.user.status,
           revoked_sessions: ctx.result.revokedSessions,
           correlation_id: currentCorrelation().correlationId,
+        });
+        await recordMutationAudit(modules, ctx.principal, ctx.owner, {
+          action: 'users.user.status_changed',
+          targetType: 'user',
+          targetId: ctx.result.user.userId,
+          beforeVersion: ctx.result.user.version - 1,
+          afterVersion: ctx.result.user.version,
+          idempotencyKey: `users.user.status_changed:${ctx.result.user.userId}:${ctx.result.user.version}`,
+          details: { status: ctx.result.user.status, revokedSessions: ctx.result.revokedSessions },
         });
       },
       respond: (ctx) =>
@@ -258,7 +283,7 @@ export function registerUsersRoutes(
         await modules.auth.issueCredential({ userId: ctx.params.userId, password: body.password });
         return { userId: ctx.params.userId };
       },
-      emit: (ctx) => {
+      emit: async (ctx) => {
         logger.info('auth.credential.issued', undefined, {
           user_id: ctx.result.userId,
           actor:
@@ -268,6 +293,14 @@ export function registerUsersRoutes(
               ? ctx.principal.userId
               : null,
           correlation_id: currentCorrelation().correlationId,
+        });
+        // Audited WITHOUT the password: the event records THAT a credential
+        // was issued, never the material (implementation-contract §21).
+        await recordMutationAudit(modules, ctx.principal, ctx.owner, {
+          action: 'auth.credential.issued',
+          targetType: 'user',
+          targetId: ctx.result.userId,
+          idempotencyKey: null,
         });
       },
       respond: () => jsonResponse(204, undefined),
@@ -301,11 +334,18 @@ export function registerUsersRoutes(
         });
         return { user, role: body.role };
       },
-      emit: (ctx) => {
+      emit: async (ctx) => {
         logger.info('users.platform_role.granted', undefined, {
           user_id: ctx.result.user.userId,
           role: ctx.result.role,
           correlation_id: currentCorrelation().correlationId,
+        });
+        await recordMutationAudit(modules, ctx.principal, ctx.owner, {
+          action: 'users.platform_role.granted',
+          targetType: 'user',
+          targetId: ctx.result.user.userId,
+          idempotencyKey: null,
+          details: { role: ctx.result.role },
         });
       },
       respond: (ctx) => jsonResponse(200, serializeUser(ctx.result.user)),
@@ -337,11 +377,18 @@ export function registerUsersRoutes(
         });
         return { user, role: ctx.params.role };
       },
-      emit: (ctx) => {
+      emit: async (ctx) => {
         logger.info('users.platform_role.revoked', undefined, {
           user_id: ctx.result.user.userId,
           role: ctx.result.role,
           correlation_id: currentCorrelation().correlationId,
+        });
+        await recordMutationAudit(modules, ctx.principal, ctx.owner, {
+          action: 'users.platform_role.revoked',
+          targetType: 'user',
+          targetId: ctx.result.user.userId,
+          idempotencyKey: null,
+          details: { role: ctx.result.role },
         });
       },
       respond: (ctx) => jsonResponse(200, serializeUser(ctx.result.user)),

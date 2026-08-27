@@ -254,6 +254,44 @@ export class RequestTooLargeError extends AppError {
   }
 }
 
+/**
+ * Secret material could not be resolved through the credential boundary
+ * (MKT-005, CRED-001). ALWAYS fail-closed: no material is ever returned and
+ * no fallback default is used. `retryable` is true only for backend
+ * unavailability (e.g. an unmounted backend); an unknown handle is not
+ * retryable. Never carries the material in its message or details.
+ */
+export class SecretResolutionError extends AppError {
+  constructor(message: string, retryable: boolean, cause?: unknown) {
+    super({
+      code: 'PROVIDER_UNAVAILABLE',
+      message,
+      httpStatus: 503,
+      retryable,
+      retrySafe: false,
+      cause,
+    });
+  }
+}
+
+/**
+ * Cache/lock backend failure (MKT-005, AC-03 port contract). The port
+ * contract requires adapter failures to surface explicitly: a cache failure
+ * is never a fabricated value and a lock failure never silently grants
+ * mutual exclusion. PostgreSQL remains authoritative for all durable state.
+ */
+export class BackendUnavailableError extends AppError {
+  constructor(message: string, retryable = true) {
+    super({
+      code: 'PROVIDER_UNAVAILABLE',
+      message,
+      httpStatus: 503,
+      retryable,
+      retrySafe: true,
+    });
+  }
+}
+
 /** Startup configuration is invalid (process aborts; not an HTTP error). */
 export class ConfigError extends AppError {
   constructor(message: string, details?: ReadonlyArray<string>) {
