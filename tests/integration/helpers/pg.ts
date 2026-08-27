@@ -28,7 +28,19 @@ const testDepsDir = path.join(repoRoot, '.test-deps');
 
 const ICU_DEB_URL = 'https://archive.ubuntu.com/ubuntu/pool/main/i/icu/libicu60_60.2-3ubuntu3_amd64.deb';
 
-/** Returns a directory containing libicuuc.so.60, or null when the host already provides ICU 60. */
+/** SHA-256 of the pinned libicu60 package (integrity: a truncated download must fail loudly). */
+const ICU_DEB_SHA256 = '7a2f29ea19f2a14007fd84f25eb88db4fb3ca43bdb07fdb681329d2b5daca500';
+
+/**
+ * Returns a directory containing libicuuc.so.60, or null when the host already
+ * provides ICU 60.
+ *
+ * Concurrent-safe: test files run in parallel processes. Downloads go to
+ * process-unique temp files, extraction happens into a staging directory, and
+ * the result is installed with an atomic rename — a partially-downloaded or
+ * partially-extracted library can never be observed by another process
+ * (a truncated ICU library makes the PostgreSQL binaries die with SIGBUS).
+ */
 export function ensureIcu60(): string | null {
   const override = process.env['MOS_TEST_ICU_LIB_DIR'];
   if (override !== undefined && override !== '') {
@@ -43,27 +55,75 @@ export function ensureIcu60(): string | null {
 
   fs.mkdirSync(testDepsDir, { recursive: true });
   const debPath = path.join(testDepsDir, 'libicu60.deb');
-  if (!fs.existsSync(debPath)) {
-    process.stderr.write(`[pg-harness] downloading libicu60 for embedded PostgreSQL (${ICU_DEB_URL})\n`);
-    execFileSync(
-      process.execPath,
-      [
-        '-e',
-        `const fs=require('fs');const https=require('https');const file=fs.createWriteStream(${JSON.stringify(debPath)});https.get(${JSON.stringify(ICU_DEB_URL)},r=>{if(r.statusCode!==200){process.exit(3)}r.pipe(file);file.on('finish',()=>file.close())}).on('error',()=>process.exit(4));`,
-      ],
-      { stdio: 'inherit', timeout: 120_000 },
-    );
+  let verifiedDeb: string;
+  if (fs.existsSync(debPath) && sha256OfFile(debPath) === ICU_DEB_SHA256) {
+    verifiedDeb = debPath;
+  } else {
+    // Download into a process-private file, verify, then publish atomically.
+    // Even if a concurrent process wins the publish, this process extracts
+    // from its own verified copy.
+    const privateDeb = `${debPath}.verified-${process.pid}`;
+    downloadVerified(ICU_DEB_URL, privateDeb, ICU_DEB_SHA256);
+    verifiedDeb = privateDeb;
     if (!fs.existsSync(debPath)) {
-      throw new Error('libicu60 download failed');
+      try {
+        fs.renameSync(privateDeb, debPath);
+        verifiedDeb = debPath;
+      } catch {
+        // Another process published first; keep using the private copy.
+      }
     }
   }
-  const extractDir = path.join(testDepsDir, 'icu60');
-  fs.mkdirSync(extractDir, { recursive: true });
-  execFileSync('dpkg-deb', ['-x', debPath, extractDir], { stdio: 'inherit' });
-  if (!fs.existsSync(path.join(libDir, 'libicuuc.so.60'))) {
+
+  // Extract into a process-unique staging directory, then install atomically.
+  const staging = path.join(testDepsDir, `icu60-staging-${process.pid}`);
+  fs.rmSync(staging, { recursive: true, force: true });
+  fs.mkdirSync(staging, { recursive: true });
+  execFileSync('dpkg-deb', ['-x', verifiedDeb, staging], { stdio: 'inherit' });
+  fs.rmSync(`${debPath}.verified-${process.pid}`, { force: true });
+  const stagedLib = path.join(staging, 'usr', 'lib', 'x86_64-linux-gnu', 'libicuuc.so.60');
+  if (!fs.existsSync(stagedLib)) {
+    fs.rmSync(staging, { recursive: true, force: true });
     throw new Error('libicu60 extracted but libicuuc.so.60 missing');
   }
+
+  const installDir = path.join(testDepsDir, 'icu60');
+  try {
+    fs.renameSync(staging, installDir);
+  } catch {
+    // Another concurrent process installed it first — use theirs.
+    fs.rmSync(staging, { recursive: true, force: true });
+  }
+  if (!fs.existsSync(path.join(libDir, 'libicuuc.so.60'))) {
+    throw new Error('libicu60 provisioning failed: libicuuc.so.60 not present after install');
+  }
   return libDir;
+}
+
+function downloadVerified(url: string, targetPath: string, expectedSha256: string): void {
+  process.stderr.write(`[pg-harness] downloading libicu60 for embedded PostgreSQL (${url})\n`);
+  const tempPath = `${targetPath}.part-${process.pid}`;
+  execFileSync(
+    process.execPath,
+    [
+      '-e',
+      `const fs=require('fs');const https=require('https');const file=fs.createWriteStream(${JSON.stringify(tempPath)});https.get(${JSON.stringify(url)},r=>{if(r.statusCode!==200){process.exit(3)}r.pipe(file);file.on('finish',()=>file.close())}).on('error',()=>process.exit(4));`,
+    ],
+    { stdio: 'inherit', timeout: 120_000 },
+  );
+  if (!fs.existsSync(tempPath)) {
+    throw new Error('libicu60 download failed');
+  }
+  const digest = sha256OfFile(tempPath);
+  if (digest !== expectedSha256) {
+    fs.rmSync(tempPath, { force: true });
+    throw new Error(`libicu60 download integrity mismatch: sha256 ${digest} != ${expectedSha256}`);
+  }
+  fs.renameSync(tempPath, targetPath);
+}
+
+function sha256OfFile(filePath: string): string {
+  return execFileSync('sha256sum', [filePath], { encoding: 'utf8' }).split(/\s+/)[0] ?? '';
 }
 
 function systemHasIcu60(): boolean {

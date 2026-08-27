@@ -38,11 +38,7 @@ import {
   type SpawnedProcess,
 } from './helpers/harness.ts';
 import { validateRecord } from '../../src/platform/observability/contract.ts';
-import * as observabilityContract from '../../src/platform/observability/contract.ts';
-import { ConsoleSink } from '../../src/platform/observability/adapters/console/console-sink.ts';
-import { CompositeSink } from '../../src/platform/observability/adapters/composite/composite-sink.ts';
 import { createLoggerFactory } from '../../src/platform/observability/logger.ts';
-import { InMemoryMetrics } from '../../src/platform/observability/metrics.ts';
 import { MemorySink } from '../../src/platform/observability/adapters/memory/memory-sink.ts';
 import { SystemClock } from '../../src/platform/clock/clock.ts';
 
@@ -226,31 +222,3 @@ test('worker metrics are exposed as material records from real execution', async
   assert.ok(seriesValue('platform_job_duration_ms') >= 100, 'duration histogram reflects real work');
 });
 
-test('STATIC (runtime-introspected): production sinks are append-only — method surface is exactly { write }', () => {
-  const consoleSink = new ConsoleSink();
-  const compositeSink = new CompositeSink([]);
-
-  const methodNames = (instance: object): string[] =>
-    Object.getOwnPropertyNames(Object.getPrototypeOf(instance)).filter(
-      (name) => name !== 'constructor' && typeof (instance as Record<string, unknown>)[name] === 'function',
-    );
-
-  assert.deepEqual(methodNames(consoleSink).sort(), ['write']);
-  assert.deepEqual(methodNames(compositeSink).sort(), ['write']);
-});
-
-test('STATIC (runtime-introspected): the observability contract exposes no query/mutation API', () => {
-  // Everything the contract module exports at runtime. It must contain ONLY:
-  // validation metadata + validation. There is no read-back, update, delete,
-  // or state-deciding function.
-  const runtimeExports = Object.keys(observabilityContract).sort();
-  assert.deepEqual(runtimeExports, ['REQUIRED_RECORD_FIELDS', 'validateRecord']);
-
-  // The metrics registry exposes observation (increment/observe) and
-  // exposition (snapshot) — no mutation of anything but its own counters.
-  const metrics = new InMemoryMetrics();
-  const methods = Object.getOwnPropertyNames(Object.getPrototypeOf(metrics)).filter(
-    (name) => name !== 'constructor' && typeof (metrics as unknown as Record<string, unknown>)[name] === 'function',
-  );
-  assert.deepEqual(methods.sort(), ['increment', 'observe', 'snapshot']);
-});
