@@ -1,16 +1,24 @@
 /**
- * Server-side authorization helpers for identity routes (MKT-002).
+ * Server-side authorization helpers for identity routes (MKT-002) and Client
+ * tenancy routes (MKT-003).
  *
  * Every check resolves the caller's authorization context FRESH from durable
  * state (users + agency memberships in PostgreSQL) — headers, body fields or
  * client-side claims are never trusted (issue #6 security contract:
  * "frontend-only checks are never authoritative", "A raw Agency/User ID is
  * not an authorization credential").
+ *
+ * MKT-003 (issue #9): Client is the hard security/data boundary, so
+ * cross-tenant probes get a UNIFORM 404 — a Client identifier belonging to
+ * another Agency is indistinguishable from an unknown identifier (no
+ * existence/traversal oracle, TENANT-AC-04). Intra-tenant failures (suspended
+ * membership, wrong role) are 403s exactly like /agencies.
  */
 
 import { ForbiddenError, NotFoundError } from '../platform/errors/errors.ts';
 import type { Principal } from '../platform/http/auth/contract.ts';
 import type { AgencyRoleKey, AuthorizationContext } from '../modules/agencies/public.ts';
+import type { ClientOwnerContext } from '../modules/clients/public.ts';
 import type { ApplicationModules } from './application.ts';
 
 /**
@@ -81,4 +89,60 @@ export async function requireAgencyAccess(
   if (roles !== undefined && !roles.includes(membership.role)) {
     throw new ForbiddenError('This operation requires a different agency role');
   }
+}
+
+/**
+ * Client-scoped access check (issue #9 MKT-003-AC-01/TENANT-AC-03/04).
+ *
+ * Step 1 resolves the CANONICAL Client ownership from durable state
+ * (client row → owning Agency) BEFORE anything else — a deleted tombstone or
+ * an unknown identifier is a uniform 404. Step 2 authorizes the caller
+ * against the OWNING agency's durable membership state:
+ *
+ *   - service principal and platform administrators (platform operators,
+ *     mirroring requireAgencyAccess) pass;
+ *   - a caller with NO membership in the OWNING agency gets the SAME 404 as
+ *     for an unknown Client — a foreign Client identifier is not a
+ *     traversal/existence oracle (TENANT-AC-04, security-threat-model
+ *     "Cross-tenant traversal");
+ *   - a suspended (disabled) membership or disabled identity never
+ *     authorizes (403, MKT-002-AC-05 semantics at Client scope);
+ *   - `roles` optionally restricts to specific agency roles (403 otherwise).
+ *
+ * Returns the canonical owner context the operation is scoped to.
+ */
+export async function requireClientAccess(
+  modules: ApplicationModules,
+  principal: Principal,
+  clientId: string,
+  roles?: ReadonlyArray<AgencyRoleKey>,
+): Promise<ClientOwnerContext> {
+  const ownership = await modules.clients.resolveClientOwnership(clientId);
+  if (ownership === null) {
+    throw new NotFoundError('client', clientId);
+  }
+
+  if (principal.kind === 'service') return ownership;
+
+  const context = await resolveContext(modules, principal);
+  if (context === null || context.principal.status !== 'active') {
+    throw new ForbiddenError('Active user identity required');
+  }
+  if (context.platformRoles.includes('platform_administrator')) return ownership;
+
+  const membership = context.memberships.find(
+    (entry) => entry.agencyId === ownership.client.agencyId,
+  );
+  if (membership === undefined) {
+    // Hard boundary: not a member of the OWNING agency → indistinguishable
+    // from an unknown Client (uniform 404, no cross-tenant oracle).
+    throw new NotFoundError('client', clientId);
+  }
+  if (membership.membershipStatus !== 'active') {
+    throw new ForbiddenError('Active membership in the client agency required');
+  }
+  if (roles !== undefined && !roles.includes(membership.role)) {
+    throw new ForbiddenError('This operation requires a different agency role');
+  }
+  return ownership;
 }

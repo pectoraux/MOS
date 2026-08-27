@@ -1,5 +1,6 @@
 /**
- * API router assembly (MKT-001 platform + MKT-002 identity routes).
+ * API router assembly (MKT-001 platform + MKT-002 identity routes + MKT-003
+ * Client tenancy routes).
  *
  * One Router instance serves every module surface; each register* function
  * owns its /api/<module>/* prefix. The composition root builds the services
@@ -13,6 +14,7 @@ import { registerPlatformRoutes } from './platform-routes.ts';
 import { registerAuthRoutes } from './auth-routes.ts';
 import { registerUsersRoutes } from './users-routes.ts';
 import { registerAgenciesRoutes } from './agencies-routes.ts';
+import { registerClientsRoutes } from './clients-routes.ts';
 
 export function buildApiRouter(services: AppServices, modules: ApplicationModules): Router {
   const router = new Router();
@@ -20,5 +22,6 @@ export function buildApiRouter(services: AppServices, modules: ApplicationModule
   registerAuthRoutes(router, services, modules);
   registerUsersRoutes(router, services, modules);
   registerAgenciesRoutes(router, services, modules);
+  registerClientsRoutes(router, services, modules);
   return router;
 }
