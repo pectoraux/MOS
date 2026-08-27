@@ -29,9 +29,11 @@
     "spec/implementation-contract-v1.2.md",
     "spec/job-offer-v1.2.md",
     "spec/work-item-v1.2-overrides.md",
+    "spec/preflight.md",
     "AGENTS.md"
   ],
   "override_precedence": "v1.2 override documents supersede only the v1.1 clauses they explicitly identify; all other v1.1 frozen contracts remain authoritative",
+  "preflight": "spec/preflight.md",
   "core_boundaries": [
     "Agency",
     "Client",
