@@ -8,66 +8,66 @@ Read, in this order:
 
 1. `README.md`
 2. `spec/frozen-manifest.json`
-3. `spec/architecture.md`
-4. `spec/architecture-lock.md`
-5. `spec/implementation-contract.md`
-6. every listed `spec/*-v1.2*` and `spec/*-v1.3*` override/addendum document
-7. `spec/state-machines.md`
-8. `spec/requirements.md`
-9. the relevant `spec/*-v1.3.md` requirement addendum
-10. `spec/work-items.md`
-11. `spec/work-item-v1.3-overrides.md` when relevant
-12. `spec/dependency-graph.md`
-13. `spec/dependency-graph-v1.3.md` when relevant
-14. `spec/traceability-matrix.md`
-15. `spec/traceability-v1.3.md` when relevant
-16. `spec/work-item-matrix.md`
-17. `spec/module-dependency-matrix.md`
-18. `spec/security-threat-model.md`
-19. `spec/adr/*`
-20. the specific Work Item's complete Work Order
+3. `spec/frozen-manifest-v1.4.json`
+4. `spec/architecture.md`
+5. `spec/architecture-lock.md`
+6. all listed v1.2, v1.3 and v1.4 override/addendum documents
+7. `spec/requirements.md`
+8. applicable v1.3/v1.4 requirement addenda
+9. `spec/implementation-contract.md`
+10. `spec/state-machines.md` and applicable corrections
+11. `spec/work-items.md`, v1.3 overrides and effective backlog
+12. dependency, traceability and Work Item matrices for the relevant Work Item
+13. `spec/module-dependency-matrix.md` and v1.3 dependency addendum
+14. `spec/security-threat-model.md`
+15. `spec/work-item-template.md`
+16. `spec/preflight-v1.4.md`
+17. `spec/adr/*`
+18. the specific Work Item's complete Work Order
 
 Do not infer missing architectural rules from prompts, conversations, prior model output, or implementation convenience.
 
 ## Authority rules
 
-- The backend/domain authority defined by the frozen architecture is authoritative.
 - Workflow state belongs only to `/workflows`.
 - Execution identity/lifecycle belongs only to `/executions`.
+- Deployment intent/lifecycle belongs only to `/deployments`.
 - Evidence/provenance belongs only to `/evidence`.
 - AI routing belongs only to `/ai-runtime`.
 - Client isolation is enforced server-side before dependent traversal or external access.
 - No provider SDK may leak into domain/application modules.
-- No extension, human, model, worker, or frontend may silently become an alternate authority.
+- No extension, human, model, worker, Domain Pack or frontend may become an alternate authority.
 - Human Agents use the existing Job/Task/Execution authorities.
-- Domain Packs use the existing tenant, workflow, execution, evidence, credential, policy, AI-routing and Job authorities.
+- Domain Packs use core authorities and may not create parallel engines.
+- Deployment may request execution but may not mutate Workflow/Execution lifecycle directly.
 
 ## Evidence rule
 
-Never report an implementation as complete because an agent says it is complete. Verify the acceptance criteria with the required evidence. Record environment limitations honestly.
+Never report an implementation as complete because an agent says it is complete. Verify the acceptance criteria with the required evidence and record limitations honestly.
 
 ## Architecture-change rule
 
 If implementation appears to require changing a frozen rule, stop and report an Architecture Change Request requirement. Do not modify the frozen architecture opportunistically.
 
-## v1.2 rules
+## v1.2/v1.3 runtime rules
 
 - Persistent sandboxes are Workspace-scoped and leased to Executions.
 - `execution_id` is never Sandbox identity.
-- `UNKNOWN` execution outcome is not success and is reconciled explicitly.
-- A non-idempotent side effect must not be blindly replayed after an unknown outcome.
+- UNKNOWN execution outcome is unresolved, never success, and requires reconciliation.
+- Non-idempotent unknown side effects must not be blindly replayed.
 - Candidate-specific Job Offers are concurrency-safe claims.
+- Human Agent is the generic human execution participant; Field Agent and creator-management roles are specializations.
+- Domain Packs are composition layers; Creator Operations is a Domain Pack.
 
-## v1.3 rules
+## v1.4 deployment rules
 
-- `Human Agent` is the generic human execution participant; `Field Agent` is a specialization.
-- Human Agent specializations such as Chatter and Creator Manager do not create separate workflow/job/execution authorities.
-- Domain Packs are composition layers, not tenants and not execution engines.
-- Creator Operations is a Domain Pack, not a separate product/runtime.
-- Creator/fan/conversation/content/monetization data remains Client-scoped.
-- Creator-platform-specific APIs, SDKs, browser automation and scraping live behind Integration/Extension boundaries.
-- Creator Operations uses the common AI Router, Policy, Job, Execution, Evidence and Learning authorities.
+- Marketing Cloud Deployment is the product's Vercel-like deployment primitive.
+- Deployment binds authorized Client Workspaces to immutable Playbook/Workflow versions.
+- Activation validates dependencies, permissions, credentials, policies, runtime requirements and triggers before becoming ACTIVE.
+- Redeploy/rollback changes future version selection only and never rewrites historical Execution, Outcome, Evidence or Learning records.
+- Deployment does not become a second workflow/execution engine.
+- Runtime substrate is implementation-defined behind the frozen capability requirements; Vercel-class web hosting and AWS-class runtime infrastructure are preferred roles, not hard vendor coupling.
 
 ## Expected implementation style
 
-Prefer the smallest architecture-consistent implementation. Use database constraints, CAS/version checks, append-oriented records, durable jobs/outbox mechanisms, and negative regression tests for security/concurrency invariants where applicable.
+Prefer the smallest architecture-consistent implementation. Use database constraints, CAS/version checks, append-oriented records, durable queue/outbox mechanisms, and negative regression tests for security/concurrency invariants where applicable.
