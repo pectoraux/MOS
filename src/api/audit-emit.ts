@@ -36,6 +36,34 @@ export function auditActor(principal: Principal): string {
   return 'anonymous';
 }
 
+/**
+ * Server-derived tenant scope fields from the pipeline OwnerScope: the
+ * agency is carried by every scoped owner; the client by client/workspace/
+ * goal owners (and by client-scoped playbooks); the workspace by
+ * workspace/goal owners. Playbooks carry no workspace scope (the frozen
+ * ownership matrix scopes a Playbook to an Agency or a Client).
+ */
+function ownerScopeAuditFields(owner: OwnerScope): {
+  agencyId: string | null;
+  clientId: string | null;
+  workspaceId: string | null;
+} {
+  if (owner.kind === 'platform') {
+    return { agencyId: null, clientId: null, workspaceId: null };
+  }
+  return {
+    agencyId: owner.agencyId,
+    clientId:
+      owner.kind === 'client' || owner.kind === 'workspace' || owner.kind === 'goal'
+        ? owner.clientId
+        : owner.kind === 'playbook'
+          ? owner.clientId
+          : null,
+    workspaceId:
+      owner.kind === 'workspace' ? owner.workspaceId : owner.kind === 'goal' ? owner.workspaceId : null,
+  };
+}
+
 export interface MutationAuditParams {
   /** Dot-namespaced action, e.g. 'clients.created'. */
   readonly action: string;
@@ -67,22 +95,7 @@ export async function recordMutationAudit(
   params: MutationAuditParams,
 ): Promise<void> {
   const correlation = currentCorrelation();
-  const scope =
-    owner.kind === 'agency' || owner.kind === 'client' || owner.kind === 'workspace' || owner.kind === 'goal'
-      ? {
-          agencyId: owner.agencyId,
-          clientId:
-            owner.kind === 'client' || owner.kind === 'workspace' || owner.kind === 'goal'
-              ? owner.clientId
-              : null,
-          workspaceId:
-            owner.kind === 'workspace'
-              ? owner.workspaceId
-              : owner.kind === 'goal'
-                ? owner.workspaceId
-                : null,
-        }
-      : { agencyId: null, clientId: null, workspaceId: null };
+  const scope = ownerScopeAuditFields(owner);
 
   await modules.audit.appendAuditEvent({
     actor: auditActor(principal),

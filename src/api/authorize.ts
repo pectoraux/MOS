@@ -1,7 +1,8 @@
 /**
  * Server-side authorization helpers for identity routes (MKT-002), Client
  * tenancy routes (MKT-003), Workspace boundary routes (MKT-004), Goal
- * domain routes (MKT-006) and credential-reference routes (MKT-005).
+ * domain routes (MKT-006), credential-reference routes (MKT-005) and
+ * Playbook domain routes (MKT-007).
  *
  * Every check resolves the caller's authorization context FRESH from durable
  * state (users + agency memberships in PostgreSQL) — headers, body fields or
@@ -30,6 +31,7 @@ import type { AgencyRoleKey, AuthorizationContext } from '../modules/agencies/pu
 import type { ClientOwnerContext } from '../modules/clients/public.ts';
 import type { CredentialRecord } from '../modules/credentials/public.ts';
 import type { GoalOwnerContext } from '../modules/goals/public.ts';
+import type { PlaybookOwnerContext } from '../modules/playbooks/public.ts';
 import type { WorkspaceOwnerContext } from '../modules/workspaces/public.ts';
 import type { ApplicationModules } from './application.ts';
 
@@ -277,6 +279,69 @@ export async function requireGoalAccess(
   }
   if (membership.membershipStatus !== 'active') {
     throw new ForbiddenError('Active membership in the goal client agency required');
+  }
+  if (roles !== undefined && !roles.includes(membership.role)) {
+    throw new ForbiddenError('This operation requires a different agency role');
+  }
+  return ownership;
+}
+
+/**
+ * Playbook-scoped access check (MKT-007).
+ *
+ * Step 1 resolves the CANONICAL Playbook ownership from durable state
+ * (playbook row → owning Agency directly for Agency-scoped reusable IP, or
+ * playbook row → owning Client via /clients resolveClientOwnership → owning
+ * Agency for Client-scoped playbooks, plus the linked Goal row when set)
+ * BEFORE anything else — an unknown playbook and a playbook whose Client is
+ * a deleted tombstone: all resolve to a uniform 404, indistinguishable.
+ * Step 2 authorizes the caller against the OWNING agency, using the SAME
+ * durable membership authority as every other scoped check (no second
+ * authorization authority):
+ *
+ *   - service principal and platform administrators pass;
+ *   - a caller with NO membership in the owning agency gets the SAME 404 as
+ *     for an unknown Playbook — a foreign Playbook identifier is not a
+ *     traversal/existence oracle (cross-tenant posture; rejection happens
+ *     BEFORE any dependent traversal);
+ *   - a suspended (disabled) membership or disabled identity never
+ *     authorizes (403);
+ *   - `roles` optionally restricts to specific agency roles (403 otherwise).
+ *
+ * Returns the canonical owner context the operation is scoped to. A
+ * Playbook ID is NEVER itself an authorization credential — it only selects
+ * WHICH durable ownership chain gets resolved.
+ */
+export async function requirePlaybookAccess(
+  modules: ApplicationModules,
+  principal: Principal,
+  playbookId: string,
+  roles?: ReadonlyArray<AgencyRoleKey>,
+): Promise<PlaybookOwnerContext> {
+  const ownership = await modules.playbooks.resolvePlaybookOwnership(playbookId);
+  if (ownership === null) {
+    throw new NotFoundError('playbook', playbookId);
+  }
+
+  if (principal.kind === 'service') return ownership;
+
+  const context = await resolveContext(modules, principal);
+  if (context === null || context.principal.status !== 'active') {
+    throw new ForbiddenError('Active user identity required');
+  }
+  if (context.platformRoles.includes('platform_administrator')) return ownership;
+
+  const membership = context.memberships.find(
+    (entry) => entry.agencyId === ownership.agency.agencyId,
+  );
+  if (membership === undefined) {
+    // Hard boundary: not a member of the OWNING agency → indistinguishable
+    // from an unknown Playbook (uniform 404, no cross-tenant oracle;
+    // rejection BEFORE any dependent traversal).
+    throw new NotFoundError('playbook', playbookId);
+  }
+  if (membership.membershipStatus !== 'active') {
+    throw new ForbiddenError('Active membership in the playbook agency required');
   }
   if (roles !== undefined && !roles.includes(membership.role)) {
     throw new ForbiddenError('This operation requires a different agency role');
