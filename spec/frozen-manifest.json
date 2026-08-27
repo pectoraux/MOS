@@ -22,18 +22,16 @@
     "spec/module-dependency-matrix.md",
     "spec/work-item-matrix.md",
     "spec/change-request-002.md",
+    "spec/architecture-v1.2-addendum.md",
+    "spec/architecture-lock-v1.2.md",
     "spec/tenant-runtime-v1.2.md",
     "spec/state-machines-v1.2.md",
     "spec/implementation-contract-v1.2.md",
     "spec/job-offer-v1.2.md",
+    "spec/work-item-v1.2-overrides.md",
     "AGENTS.md"
   ],
-  "v1_2_overrides": {
-    "tenant_runtime": "spec/tenant-runtime-v1.2.md",
-    "state_machines": "spec/state-machines-v1.2.md",
-    "implementation_contract": "spec/implementation-contract-v1.2.md",
-    "field_job_offers": "spec/job-offer-v1.2.md"
-  },
+  "override_precedence": "v1.2 override documents supersede only the v1.1 clauses they explicitly identify; all other v1.1 frozen contracts remain authoritative",
   "core_boundaries": [
     "Agency",
     "Client",
