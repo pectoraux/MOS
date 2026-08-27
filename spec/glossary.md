@@ -1,0 +1,21 @@
+# Glossary
+
+- **Agency:** commercial/root tenant containing users and Clients.
+- **Client:** hard security/data boundary representing an agency customer.
+- **Workspace:** organizational execution environment within a Client.
+- **Goal:** measurable business/acquisition objective.
+- **Playbook:** reusable, versioned strategy/workflow template.
+- **Workflow:** governed directed graph of work nodes and legal state transitions.
+- **Task:** atomic governed unit of work inside a Workflow.
+- **Execution:** concrete runtime instance of a Task or Workflow.
+- **Agent:** logical reusable capability; not an infrastructure boundary.
+- **AI Agent:** Agent whose decision/generation capability uses one or more AI models.
+- **Field Agent:** human platform user who performs physical/customer-facing Jobs.
+- **Job:** human-facing projection of a governed Task, including acceptance and assignment.
+- **Sandbox:** isolated runtime environment allocated to an Execution.
+- **Evidence:** traceable information supporting a claim/decision.
+- **Experiment:** declared test of a hypothesis with explicit treatment/comparison and analysis.
+- **Outcome:** observed result of an Execution or Experiment.
+- **Learning:** durable, scoped conclusion derived from evidence/outcomes.
+- **Extension:** versioned, permissioned capability package provided by the platform or a third party.
+- **AI Runtime:** provider-neutral subsystem for task normalization, routing, evaluation, and model/provider execution.
