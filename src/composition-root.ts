@@ -42,6 +42,12 @@
  *     to the /credentials module — the only consumer of material;
  *   - the /credentials (CRED-001) and /audit (AUD-001) modules are
  *     constructed here with platform ports only.
+ *
+ * MKT-006 additions:
+ *   - the /goals module is constructed here (dependency matrix:
+ *     /goals ──→ /clients, /workspaces) owning Goal identity, measurable
+ *     content, lifecycle and canonical owner resolution THROUGH /clients
+ *     (and /workspaces for the optional scope).
  */
 
 import fs from 'node:fs';
@@ -78,6 +84,7 @@ import { createClientsModule } from './modules/clients/public.ts';
 import { createWorkspacesModule } from './modules/workspaces/public.ts';
 import { createCredentialsModule } from './modules/credentials/public.ts';
 import { createAuditModule } from './modules/audit/public.ts';
+import { createGoalsModule } from './modules/goals/public.ts';
 import type { ApplicationModules } from './api/application.ts';
 
 export interface AppOptions {
@@ -160,7 +167,8 @@ function buildCore(config: AppConfig, options: AppOptions): Core {
 
   // Module wiring (dependency matrix: /auth → /users; /agencies → /users;
   // /clients → /agencies, /auth; /workspaces → /clients; /credentials and
-  // /audit import no other module — they take platform ports + plain data).
+  // /audit import no other module — they take platform ports + plain data;
+  // /goals → /clients, /workspaces).
   const users = createUsersModule({ db, clock, ids });
   const auth = createAuthModule({
     db,
@@ -174,6 +182,7 @@ function buildCore(config: AppConfig, options: AppOptions): Core {
   const workspaces = createWorkspacesModule({ db, clock, ids, clients });
   const credentials = createCredentialsModule({ db, clock, ids, secrets });
   const audit = createAuditModule({ db, clock, ids });
+  const goals = createGoalsModule({ db, clock, ids, clients, workspaces });
 
   // Authentication order: user sessions first, then the internal service
   // token. Every path fails closed (CompositeAuthenticator).
@@ -200,7 +209,7 @@ function buildCore(config: AppConfig, options: AppOptions): Core {
         metrics,
       },
     },
-    modules: { users, auth, agencies, clients, workspaces, credentials, audit },
+    modules: { users, auth, agencies, clients, workspaces, credentials, audit, goals },
   };
 }
 

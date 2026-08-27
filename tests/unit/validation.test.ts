@@ -174,3 +174,143 @@ test('intField accepts safe integers at its bounds', () => {
   assert.equal(intField({ min: 1, max: 10 }).parse(1, []), 1);
   assert.equal(intField({ min: 1, max: 10 }).parse(10, []), 10);
 });
+
+// ---------------------------------------------------------------------------
+// MKT-006 additions: numberField, arrayField, objectField, isoDateField —
+// the generic validation surface the Goals domain composes for measurable
+// success criteria (GOAL-AC-01), metrics, constraints and time horizons.
+// ---------------------------------------------------------------------------
+
+import {
+  arrayField,
+  isoDateField,
+  numberField,
+  objectField,
+  optionalIsoDateField,
+  optionalNumber,
+} from '../../src/platform/http/validation.ts';
+
+type CriterionBody = {
+  metric: string;
+  comparator: string;
+  targetValue: number;
+  unit: string | undefined;
+};
+
+function criteriaSpec(): ObjectSpec<{ criteria: CriterionBody[] }> {
+  return {
+    fields: {
+      criteria: arrayField({
+        minItems: 1,
+        maxItems: 3,
+        item: objectField<CriterionBody>({
+          forbiddenKeys: ['id'],
+          fields: {
+            metric: stringField({ minLength: 1, maxLength: 40 }),
+            comparator: stringField({ pattern: /^(>=|<=)$/ }),
+            targetValue: numberField(),
+            unit: optionalString({ maxLength: 10 }),
+          },
+        }),
+      }),
+    },
+  };
+}
+
+test('numberField accepts finite integers and decimals, rejects the rest', () => {
+  assert.equal(numberField().parse(42, []), 42);
+  assert.equal(numberField().parse(12.5, []), 12.5);
+  assert.equal(numberField({ min: 0 }).parse(0, []), 0);
+  for (const bad of ['10', NaN, Infinity, -Infinity, null, undefined, {}, true]) {
+    const problems: string[] = [];
+    numberField().parse(bad, problems);
+    assert.ok(problems.length > 0, `numberField must reject ${String(bad)}`);
+  }
+  const problems: string[] = [];
+  numberField({ min: 5, max: 10 }).parse(3, problems);
+  assert.deepEqual(problems, ['must be >= 5']);
+  const none: string[] = [];
+  assert.equal(optionalNumber().parse(undefined, none), undefined);
+});
+
+test('arrayField validates every item with index-prefixed problems', () => {
+  const good = validateObject(
+    {
+      criteria: [
+        { metric: 'leads', comparator: '>=', targetValue: 100, unit: 'count' },
+        { metric: 'cpa', comparator: '<=', targetValue: 12.5 },
+      ],
+    },
+    criteriaSpec(),
+  );
+  assert.equal(good.criteria.length, 2);
+  assert.deepEqual(good.criteria[1], { metric: 'cpa', comparator: '<=', targetValue: 12.5 });
+
+  // Non-array, null, empty below minItems, above maxItems.
+  for (const [label, body] of [
+    ['non-array', { criteria: { metric: 'x' } }],
+    ['null', { criteria: null }],
+    ['empty', { criteria: [] }],
+    ['too many', { criteria: [1, 2, 3, 4].map(() => ({ metric: 'x', comparator: '>=', targetValue: 1 })) }],
+  ] as const) {
+    const error = assertInvalidRequest(body, criteriaSpec());
+    assert.ok(
+      (error.details ?? []).some((detail) => detail.startsWith('criteria:')),
+      `${label} must be flagged on the criteria field: ${JSON.stringify(error.details)}`,
+    );
+  }
+
+  // Per-item problems carry the index and the item's field path.
+  const error = assertInvalidRequest(
+    {
+      criteria: [
+        { metric: 'leads', comparator: '>=', targetValue: 100 },
+        { metric: '', comparator: '><', targetValue: 'lots', smuggled: true },
+      ],
+    },
+    criteriaSpec(),
+  );
+  const details = error.details ?? [];
+  assert.ok(details.includes('criteria: [1].metric: must be at least 1 characters'), JSON.stringify(details));
+  assert.ok(details.includes('criteria: [1].comparator: has an invalid format'), JSON.stringify(details));
+  assert.ok(details.includes('criteria: [1].targetValue: must be a finite number'), JSON.stringify(details));
+  assert.ok(details.includes('criteria: [1].smuggled: unknown field'), JSON.stringify(details));
+});
+
+test('arrayField rejects null items and objectField rejects non-object items', () => {
+  const error = assertInvalidRequest(
+    { criteria: [{ metric: 'x', comparator: '>=', targetValue: 1 }, null] },
+    criteriaSpec(),
+  );
+  assert.ok((error.details ?? []).includes('criteria: [1]: must not be null'));
+  const error2 = assertInvalidRequest(
+    { criteria: ['just a string'] },
+    criteriaSpec(),
+  );
+  assert.ok((error2.details ?? []).includes('criteria: [0].smuggled') === false);
+  assert.ok((error2.details ?? []).some((detail) => detail.startsWith('criteria: [0]')));
+});
+
+test('objectField enforces strict keys and forbidden authority keys inside items', () => {
+  const error = assertInvalidRequest(
+    { criteria: [{ metric: 'x', comparator: '>=', targetValue: 1, id: 'server-derived' }] },
+    criteriaSpec(),
+  );
+  assert.ok(
+    (error.details ?? []).includes('criteria: [0].id: forbidden authority field; this value is derived server-side and must not be supplied'),
+    JSON.stringify(error.details),
+  );
+});
+
+test('isoDateField accepts real calendar dates and rejects everything else', () => {
+  assert.equal(isoDateField().parse('2026-01-31', []), '2026-01-31');
+  assert.equal(isoDateField().parse('2024-02-29', []), '2024-02-29', 'leap day is real');
+  for (const bad of ['2026-2-3', '01/02/2026', '2026-02-30', '2023-02-29', '2026-13-01', '20260101', 42, null]) {
+    const problems: string[] = [];
+    isoDateField().parse(bad, problems);
+    assert.ok(problems.length > 0, `isoDateField must reject ${JSON.stringify(bad)}`);
+  }
+  const none: string[] = [];
+  assert.equal(optionalIsoDateField().parse(undefined, none), undefined);
+  assert.equal(optionalIsoDateField().parse(null, none), undefined);
+});

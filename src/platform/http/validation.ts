@@ -113,6 +113,153 @@ export function optionalInt(options: { min?: number; max?: number } = {}): Field
   };
 }
 
+/** Finite numeric field (integers AND decimals — e.g. metric targets). */
+export function numberField(options: { min?: number; max?: number } = {}): FieldSpec<number> {
+  return {
+    required: true,
+    parse: (value, problems) => {
+      if (typeof value !== 'number' || !Number.isFinite(value)) {
+        problems.push('must be a finite number');
+        return 0;
+      }
+      if (options.min !== undefined && value < options.min) {
+        problems.push(`must be >= ${options.min}`);
+      }
+      if (options.max !== undefined && value > options.max) {
+        problems.push(`must be <= ${options.max}`);
+      }
+      return value;
+    },
+  };
+}
+
+/** Optional finite numeric field. */
+export function optionalNumber(options: { min?: number; max?: number } = {}): FieldSpec<number | undefined> {
+  return {
+    required: false,
+    parse: (value, problems) => {
+      if (value === undefined) return undefined;
+      return numberField(options).parse(value, problems);
+    },
+  };
+}
+
+/**
+ * Array field with a per-item spec: every element must satisfy `item`.
+ * Nulls and non-arrays are rejected (a JSON `null` is not an empty array).
+ */
+export function arrayField<T>(
+  options: { minItems?: number; maxItems?: number; item: FieldSpec<T> },
+): FieldSpec<T[]> {
+  return {
+    required: true,
+    parse: (value, problems) => {
+      if (!Array.isArray(value)) {
+        problems.push('must be an array');
+        return [];
+      }
+      if (options.minItems !== undefined && value.length < options.minItems) {
+        problems.push(`must contain at least ${options.minItems} item(s)`);
+      }
+      if (options.maxItems !== undefined && value.length > options.maxItems) {
+        problems.push(`must contain at most ${options.maxItems} item(s)`);
+      }
+      const out: T[] = [];
+      value.forEach((element, index) => {
+        if (element === undefined || element === null) {
+          problems.push(`[${index}]: must not be null`);
+          return;
+        }
+        const itemProblems: string[] = [];
+        const parsed = options.item.parse(element, itemProblems);
+        for (const problem of itemProblems) {
+          problems.push(`[${index}].${problem}`);
+        }
+        if (itemProblems.length === 0) out.push(parsed);
+      });
+      return out;
+    },
+  };
+}
+
+/** Optional array field: absent passes as undefined (null is still rejected). */
+export function optionalArrayField<T>(
+  options: { minItems?: number; maxItems?: number; item: FieldSpec<T> },
+): FieldSpec<T[] | undefined> {
+  return {
+    required: false,
+    parse: (value, problems) => {
+      if (value === undefined) return undefined;
+      return arrayField(options).parse(value, problems);
+    },
+  };
+}
+
+/**
+ * Strict nested-object field: the element must be a JSON object that
+ * satisfies the same strict spec rules as the request body (unknown keys
+ * rejected, authority keys rejected, declared fields validated). Item
+ * problems are prefixed with the field path by arrayField/objectField.
+ */
+export function objectField<T extends Record<string, unknown>>(
+  spec: ObjectSpec<T>,
+): FieldSpec<T> {
+  return {
+    required: true,
+    parse: (value, problems) => {
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+        problems.push('must be an object');
+        return {} as T;
+      }
+      try {
+        return validateObject(value, spec);
+      } catch (error) {
+        if (error instanceof InvalidRequestError) {
+          problems.push(...(error.details ?? [error.message]));
+          return {} as T;
+        }
+        throw error;
+      }
+    },
+  };
+}
+
+/**
+ * ISO calendar date field (YYYY-MM-DD): format AND real-calendar validity
+ * (e.g. 2025-02-30 is rejected; the date round-trips through UTC midnight).
+ */
+export function isoDateField(): FieldSpec<string> {
+  return {
+    required: true,
+    parse: (value, problems) => {
+      if (typeof value !== 'string') {
+        problems.push('must be a string');
+        return '';
+      }
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+        problems.push('must be an ISO calendar date (YYYY-MM-DD)');
+        return value;
+      }
+      const parsed = new Date(`${value}T00:00:00.000Z`);
+      if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value) {
+        problems.push('must be a real calendar date (YYYY-MM-DD)');
+      }
+      return value;
+    },
+  };
+}
+
+/** Optional ISO calendar date field. */
+export function optionalIsoDateField(): FieldSpec<string | undefined> {
+  return {
+    required: false,
+    parse: (value, problems) => {
+      if (value === undefined || value === null) return undefined;
+      return isoDateField().parse(value, problems);
+    },
+  };
+}
+
 /**
  * Validates a request body object against a strict spec.
  * Throws InvalidRequestError listing every problem.
