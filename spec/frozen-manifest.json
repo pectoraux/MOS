@@ -49,14 +49,17 @@
     "spec/marketing-cloud-deployment-v1.4.md",
     "spec/architecture-lock-v1.4.md",
     "spec/requirements-v1.4.md",
+    "spec/effective-backlog-v1.4.md",
+    "spec/traceability-v1.4.md",
+    "spec/product-scope-v1.4.md",
+    "spec/frozen-manifest-v1.4.json",
     "spec/preflight-v1.4.md",
+    "spec/change-request-004.md",
     "AGENTS.md"
   ],
   "override_precedence": "v1.4 documents supersede only the v1.1/v1.2/v1.3 clauses they explicitly identify; all other frozen contracts remain authoritative",
   "preflight": "spec/preflight-v1.4.md",
+  "effective_backlog": "spec/effective-backlog-v1.4.md",
   "core_boundaries": ["Agency","Client","Workspace","Goal","Playbook","Deployment","Workflow","Task","Execution","Agent","Job","HumanAgent","FieldAgent","Sandbox","SandboxLease","Evidence","Experiment","Learning","DomainPack","Extension"],
-  "frozen_invariants": [
-    "single_workflow_authority","single_execution_authority","single_deployment_authority","client_hard_isolation","agent_is_logical_capability","human_agent_is_generic_human_execution_participant","field_agent_is_human_agent_specialization","domain_pack_is_composition_layer","execution_acquires_runtime","persistent_sandbox_is_workspace_scoped","sandbox_lease_is_execution_scoped","provider_independent_ai_runtime","own_ai_router_above_provider_gateways","evidence_over_claims","causality_distinct_from_attribution","extensions_are_permissioned","one_execution_identity_per_logical_task","workflow_node_contracts_explicit","workflow_cycles_require_explicit_loop_contract","execution_unknown_is_not_success","unknown_requires_reconciliation","hard_ai_eligibility_before_ranking","application_owns_task_semantics","openrouter_not_authoritative","evidence_provenance_server_owned","causal_claim_requires_causal_design","job_is_one_task_projection","job_offers_are_candidate_scoped","extension_invocation_is_permission_scoped","authority_fields_server_derived","creator_operations_uses_common_platform_authorities","creator_provider_specific_logic_is_adapter_or_extension","deployment_binds_immutable_versions","deployment_does_not_execute_workflow_directly","redeploy_does_not_rewrite_history","rollback_selects_immutable_approved_version"
-  ],
-  "v1_4_manifest": "spec/frozen-manifest-v1.4.json"
+  "frozen_invariants": ["single_workflow_authority","single_execution_authority","single_deployment_authority","client_hard_isolation","agent_is_logical_capability","human_agent_is_generic_human_execution_participant","field_agent_is_human_agent_specialization","domain_pack_is_composition_layer","execution_acquires_runtime","persistent_sandbox_is_workspace_scoped","sandbox_lease_is_execution_scoped","provider_independent_ai_runtime","own_ai_router_above_provider_gateways","evidence_over_claims","causality_distinct_from_attribution","extensions_are_permissioned","one_execution_identity_per_logical_task","workflow_node_contracts_explicit","workflow_cycles_require_explicit_loop_contract","execution_unknown_is_not_success","unknown_requires_reconciliation","hard_ai_eligibility_before_ranking","application_owns_task_semantics","openrouter_not_authoritative","evidence_provenance_server_owned","causal_claim_requires_causal_design","job_is_one_task_projection","job_offers_are_candidate_scoped","extension_invocation_is_permission_scoped","authority_fields_server_derived","creator_operations_uses_common_platform_authorities","creator_provider_specific_logic_is_adapter_or_extension","deployment_binds_immutable_versions","deployment_does_not_execute_workflow_directly","redeploy_does_not_rewrite_history","rollback_selects_immutable_approved_version"]
 }
