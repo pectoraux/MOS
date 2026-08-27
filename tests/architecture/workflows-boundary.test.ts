@@ -50,13 +50,16 @@
  *      (getWorkflowDefinition), and imports ONLY the allowed authorities
  *      (/workspaces, /playbooks — a subset of the frozen matrix; the
  *      runtime authorities arrive with later Work Items);
- *   8. no execution/deployment/runtime authority is introduced: the routes
+ *   8. no execution/deployment authority is introduced: the routes
  *      file registers ONLY workflow paths, the public contract exports no
- *      instance/run/execution concepts and NO floating "latest version"
+ *      run/execution/deployment concepts and NO floating "latest version"
  *      pointer, the module composes canonical ownership (never a private
  *      permission engine), and the graph validation authority
  *      (validateWorkflowDefinitionContent) is exported for the frozen
- *      §4 MUST list;
+ *      §4 MUST list. (MKT-009 extends the SAME /workflows authority with
+ *      the §5 Workflow INSTANCE lifecycle surface — the deliberate,
+ *      reviewed export-list change this test pins; execution authority
+ *      stays forbidden.);
  *   9. migration 009 indexes are exactly the one listing surface — no
  *      permission or authority structures.
  */
@@ -523,7 +526,7 @@ test('no execution/deployment/runtime authority and no floating version pointer 
   //     execution/deployment routes);
   const registeredPaths = [...workflowsRoutes.matchAll(/'\/api\/([\w:/:-]+)'/g)].map((match) =>
     match[1]!
-      .replace(/:workspaceId|:workflowId|:definitionId/g, '')
+      .replace(/:workspaceId|:workflowId|:definitionId|:instanceId/g, '')
       .replace(/\/+/g, '/'),
   );
   for (const path of registeredPaths) {
@@ -533,11 +536,14 @@ test('no execution/deployment/runtime authority and no floating version pointer 
     );
   }
 
-  //   - the public contract exports EXACTLY the workflow-definition-domain
-  //      surface: no instance/run/execution/deployment authority types or
-  //      functions, and NO floating version pointer: content resolution
-  //      happens only through explicit version references — downstream
-  //      authorities pin an exact version.
+  //   - the public contract exports EXACTLY the workflow-domain surface:
+  //      the MKT-008 definition contract PLUS the MKT-009 §5 instance
+  //      lifecycle state machine (records, the frozen transition table
+  //      and its predicates — the "Workflow definition + instance state"
+  //      authority of implementation-contract §1). Still NO run/execution/
+  //      deployment authority types or functions and NO floating version
+  //      pointer: content resolution happens only through explicit
+  //      version references — downstream authorities pin an exact version.
   const exportedSymbols = [...workflowsPublic.matchAll(/export (?:interface|type|function|const) (\w+)/g)].map(
     (match) => match[1]!,
   );
@@ -548,6 +554,9 @@ test('no execution/deployment/runtime authority and no floating version pointer 
       'STRUCTURAL_NODE_TYPES',
       'WORKFLOW_DEFINITION_TRANSITIONS',
       'WORKFLOW_EDGE_TYPES',
+      'WORKFLOW_INSTANCE_STATUSES',
+      'WORKFLOW_INSTANCE_TERMINAL_STATUSES',
+      'WORKFLOW_INSTANCE_TRANSITIONS',
       'WORKFLOW_NODE_TYPES',
       'WorkflowAgencySummary',
       'WorkflowClientRow',
@@ -562,6 +571,10 @@ test('no execution/deployment/runtime authority and no floating version pointer 
       'WorkflowHumanApproval',
       'WorkflowIdempotencyKeyStrategy',
       'WorkflowInputMapping',
+      'WorkflowInstanceRecord',
+      'WorkflowInstanceStatus',
+      'WorkflowInstanceTransitionOutcome',
+      'WorkflowInstanceTransitionRecord',
       'WorkflowJoinContract',
       'WorkflowLoopContract',
       'WorkflowNode',
@@ -578,15 +591,17 @@ test('no execution/deployment/runtime authority and no floating version pointer 
       'WorkflowsModuleDeps',
       'composeWorkflowOwnerContext',
       'isLegalWorkflowDefinitionTransition',
+      'isLegalWorkflowInstanceTransition',
+      'isTerminalWorkflowInstanceStatus',
     ],
-    'the public surface is exactly the workflow-definition-domain contract — any new export is a deliberate, reviewed change',
+    'the public surface is exactly the workflow definition + instance lifecycle contract — any new export is a deliberate, reviewed change',
   );
   for (const symbol of exportedSymbols) {
     assert.ok(
-      !/^(start|run|pause|resume|cancel|dispatch|execute|createInstance|WorkflowInstance|WorkflowRun|WorkflowExecution)/i.test(
+      !/^(start|run|pause|resume|cancel|dispatch|execute|createInstance|WorkflowRun|WorkflowExecution|Execution)/i.test(
         symbol,
       ),
-      `the public surface must not export runtime/instance authority '${symbol}'`,
+      `the public surface must not export execution/run authority '${symbol}'`,
     );
   }
   assert.ok(
