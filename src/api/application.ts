@@ -1,6 +1,6 @@
 /**
  * Application-level module wiring contract (MKT-002, MKT-003, MKT-004,
- * MKT-005, MKT-006, MKT-007).
+ * MKT-005, MKT-006, MKT-007, MKT-008).
  *
  * src/api route builders receive the domain modules through this interface —
  * the concrete instances are created ONLY in the composition root (which is
@@ -13,6 +13,8 @@
  * MKT-006 additions: /goals (Goal lifecycle, GOAL-001).
  *
  * MKT-007 additions: /playbooks (Playbook versions, PLAY-001).
+ *
+ * MKT-008 additions: /workflows (Workflow definition graph model, WF-001).
  */
 
 import type { AgenciesModuleApi } from '../modules/agencies/public.ts';
@@ -23,6 +25,7 @@ import type { CredentialsModuleApi } from '../modules/credentials/public.ts';
 import type { GoalsModuleApi } from '../modules/goals/public.ts';
 import type { PlaybooksModuleApi } from '../modules/playbooks/public.ts';
 import type { UsersModuleApi } from '../modules/users/public.ts';
+import type { WorkflowsModuleApi } from '../modules/workflows/public.ts';
 import type { WorkspacesModuleApi } from '../modules/workspaces/public.ts';
 
 export interface ApplicationModules {
@@ -35,4 +38,5 @@ export interface ApplicationModules {
   readonly audit: AuditModuleApi;
   readonly goals: GoalsModuleApi;
   readonly playbooks: PlaybooksModuleApi;
+  readonly workflows: WorkflowsModuleApi;
 }
