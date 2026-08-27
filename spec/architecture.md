@@ -1,18 +1,20 @@
 # MarketingOS Architecture
 
-**Version:** 1.1
+**Version:** 1.4
 **Status:** FROZEN
 
-## 1. Purpose
+MarketingOS is a provider-independent, evidence-driven, multi-tenant Marketing Operating System for agencies. It organizes customer-acquisition and audience-operations work around Goals and executes that work through deterministic software, AI capabilities, Human Agents, and third-party extensions.
 
-MarketingOS is a multi-tenant Marketing Operating System for agencies. It organizes customer-acquisition work around Goals and executes that work through deterministic software, AI capabilities, human field agents, and third-party extensions.
+## 1. Core product model
 
-The system maintains two complementary graphs:
+MarketingOS is the deployment and operating layer for governed marketing operations: connect systems, define a Goal, deploy a versioned Playbook into a Client Workspace, execute a Workflow Graph, observe outcomes, measure evidence, learn, and iterate.
+
+The platform maintains two complementary graphs:
 
 1. **Workflow Graph** — how governed work moves.
 2. **Evidence/Knowledge Graph** — how claims, entities, experiments, sources, observations, outcomes, and learnings relate.
 
-The core lifecycle is:
+Core lifecycle:
 
 ```text
 Goal
@@ -21,19 +23,23 @@ Context + Evidence
  ↓
 Hypothesis / Strategy
  ↓
-Plan / Playbook
+Playbook Version
  ↓
-Workflow Graph
+Marketing Deployment
+ ↓
+Workflow Version / Graph
+ ↓
+Task(s)
  ↓
 Execution(s)
  ├── deterministic software
  ├── AI capability
  ├── extension
- └── human field agent
+ └── Human Agent
  ↓
-Measurement
+Measurement / Outcome
  ↓
-Evidence + Outcome
+Evidence
  ↓
 Learning
  ↓
@@ -43,13 +49,13 @@ next Goal / Strategy iteration
 ## 2. Architectural principles
 
 ### 2.1 System of record
-PostgreSQL is authoritative for application state, workflow state, policy state, relationships, experiments, evidence metadata, and audit state. Large artifacts may live in object storage but are referenced durably from PostgreSQL.
+PostgreSQL is authoritative for application state, workflow state, policy state, relationships, experiments, evidence metadata, deployment records, and audit state. Large artifacts may live in object storage but are referenced durably from PostgreSQL.
 
 ### 2.2 Evidence over claims
 Agent/model/human statements are claims unless backed by authoritative evidence. Important recommendations must preserve evidence references, provenance, timestamps, and applicability scope.
 
 ### 2.3 Deterministic workflow authority
-Workflow state transitions live in one workflow authority. AI may propose actions but cannot own state transitions.
+Workflow state transitions live in one workflow authority. AI, Human Agents, extensions, workers, and frontend code may propose or report results but cannot own workflow state transitions.
 
 ### 2.4 Provider independence
 Business logic does not depend on a model, hosting provider, SaaS integration, or specific scraping vendor. Providers are adapters/extensions.
@@ -63,30 +69,35 @@ Observation, prediction, attribution, association, and causal inference are dist
 ### 2.7 Modular monolith first
 Initial implementation is a TypeScript modular monolith with background workers. Runtime sandboxes and heavy workers may be separately deployed, but domain boundaries remain explicit.
 
+### 2.8 Deployment abstraction
+MarketingOS exposes a Vercel-like deployment experience without making a Vercel-class platform the mandatory runtime substrate. The product control plane is authoritative for deployment lifecycle; the runtime fabric is replaceable infrastructure.
+
 ## 3. System context
 
 ```text
-                 ┌──────────────────────┐
-                 │ Agency / Client User │
-                 └──────────┬───────────┘
-                            │
-                            ▼
-                  ┌────────────────────┐
-                  │    MarketingOS     │
-                  │ Control Plane      │
-                  └───────┬──────┬─────┘
-                          │      │
-              ┌───────────┘      └──────────────┐
-              ▼                                 ▼
-       External providers                 Runtime Fabric
-     Ads / CRM / CMS / Data          workers / sandboxes / jobs
-              │                                 │
-              └──────────────┬──────────────────┘
-                             ▼
-                     Evidence + Outcomes
-                             │
-                             ▼
-                         Learning
+                 Agency / Client / Human Agent / Developer
+                                  │
+                                  ▼
+                         MarketingOS Control Plane
+                                  │
+                  ┌───────────────┼────────────────┐
+                  │               │                │
+                  ▼               ▼                ▼
+             Deployments     Workflow Engine    AI Runtime
+                  │               │                │
+                  └───────────────┼────────────────┘
+                                  ▼
+                           Runtime Fabric
+                     workers / jobs / sandboxes
+                                  │
+                                  ▼
+                        External providers
+                                  │
+                                  ▼
+                         Evidence + Outcomes
+                                  │
+                                  ▼
+                              Learning
 ```
 
 ## 4. Tenant hierarchy
@@ -94,9 +105,9 @@ Initial implementation is a TypeScript modular monolith with background workers.
 ```text
 Platform
 └── Agency
-    ├── Users
+    ├── Users / Human Agents
     ├── Agency Policies
-    ├── Agency Playbooks
+    ├── Agency Playbooks / reusable artifacts
     ├── Agency Extensions
     └── Clients
         ├── Client Users / Collaborators
@@ -105,7 +116,7 @@ Platform
         ├── Goals
         ├── Experiments
         └── Workspaces
-            ├── Goals
+            ├── Deployments
             ├── Playbooks
             ├── Workflows
             ├── Memory / Context
@@ -124,10 +135,12 @@ At minimum:
 - Agency Admin
 - Agency Operator/Strategist
 - Client Collaborator
-- Field Agent
+- Human Agent
+- Field Agent specialization
+- Chatter / Creator Manager / Content Manager / Growth Manager / Account Manager / Reviewer / Sales Agent specializations
 - Platform Developer / Extension Publisher
 
-Role assignment is orthogonal to tenant ownership. Field Agents are platform identities that can participate in work for multiple agencies according to job authorization.
+Role assignment is orthogonal to tenant ownership. Human Agents are platform identities that can participate in work for multiple agencies according to Job authorization.
 
 ## 6. Core domain modules
 
@@ -139,6 +152,7 @@ Role assignment is orthogonal to tenant ownership. Field Agents are platform ide
 /workspaces
 /goals
 /playbooks
+/deployments
 /workflows
 /executions
 /agents
@@ -150,6 +164,7 @@ Role assignment is orthogonal to tenant ownership. Field Agents are platform ide
 /metrics
 /integrations
 /extensions
+/domain-packs
 /ai-runtime
 /policies
 /credentials
@@ -169,10 +184,11 @@ Role assignment is orthogonal to tenant ownership. Field Agents are platform ide
 | `/workspaces` | client workspace lifecycle/artifacts/context references |
 | `/goals` | business/acquisition goals and goal lifecycle |
 | `/playbooks` | reusable strategy/task templates and versions |
-| `/workflows` | workflow graph instances, legal state, orchestration |
+| `/deployments` | deployment intent, binding, lifecycle, version selection and deployment state |
+| `/workflows` | workflow graph definitions/instances, legal state, orchestration |
 | `/executions` | execution lifecycle and normalized execution records |
 | `/agents` | logical AI/software capabilities and provider-neutral agent contracts |
-| `/field-agents` | field-agent profiles, capabilities, territories, availability |
+| `/field-agents` | Human Agent authority and specializations, capabilities, territories, availability |
 | `/jobs` | human task projections, offers, acceptance, completion evidence |
 | `/evidence` | evidence records, provenance, source references, evidence quality |
 | `/experiments` | experiment design, assignment metadata, analysis methods, results |
@@ -180,12 +196,13 @@ Role assignment is orthogonal to tenant ownership. Field Agents are platform ide
 | `/metrics` | normalized metric definitions and observations |
 | `/integrations` | provider-independent connection contracts and normalized external state adapters |
 | `/extensions` | extension registry, lifecycle, permissions and contracts |
+| `/domain-packs` | Domain Pack registry, versions, installation and compatibility; no execution authority |
 | `/ai-runtime` | model registry, task profile, router, cascades, evaluations, usage |
 | `/policies` | execution/data/AI/extension/field-action policies |
 | `/credentials` | secret references and credential lifecycle abstraction |
 | `/audit` | append-oriented material-event trail |
 | `/notifications` | provider-independent delivery boundary |
-| `/reporting` | read-side views/exports; never authoritative workflow state |
+| `/reporting` | read-side views/exports; never authoritative workflow/deployment state |
 
 ## 7. Goal
 
@@ -203,23 +220,40 @@ A Goal contains:
 - owner;
 - status.
 
-Goal is not a workflow. A Goal may produce one or more Strategies/Plans and Workflow Executions.
+Goal is not a workflow. A Goal may produce one or more Strategies/Plans and Deployments.
 
 ## 8. Playbooks
 
 A Playbook is a versioned, reusable set of strategy/workflow templates.
 
-Examples:
+A published Playbook Version is immutable. Deployment references the exact Playbook Version and does not mutate it.
 
-- Weekly Paid Growth Loop
-- Content Repurposing Loop
-- Local Field Acquisition Pilot
-- Lead Qualification Loop
-- Landing Page Experiment
+## 9. Marketing Deployment
 
-A Playbook version is immutable once deployed to an active execution. A new version is required for change.
+A Marketing Deployment is the product's Vercel-like deployment primitive: it binds an immutable Playbook Version to an authorized Client Workspace under a policy snapshot and declares how the resulting Workflow should be scheduled/triggered and observed.
 
-## 9. Workflow Graph
+A Deployment contains:
+
+- deployment identity;
+- Agency/Client/Workspace scope;
+- Playbook Version reference;
+- resolved Workflow Version references;
+- required Domain Pack versions;
+- required Integration/Extension capability versions;
+- policy snapshot/reference;
+- runtime requirements;
+- trigger/schedule configuration;
+- deployment lifecycle state;
+- version metadata;
+- audit/correlation information.
+
+Deployment lifecycle is authoritative in `/deployments`. It may request workflow executions but never becomes a second workflow engine.
+
+A deployment can be paused, resumed, disabled, redeployed to a new immutable Playbook/Workflow version, or rolled back to a previously approved version where policy permits. Existing Executions retain their original versions and are not rewritten by redeploy/rollback.
+
+Deployment resolution must validate authorization, dependency compatibility, required permissions, credentials, runtime requirements, and policy before activation.
+
+## 10. Workflow Graph
 
 Workflow is a typed directed graph. Nodes are governed work units; edges express data/control dependencies.
 
@@ -235,33 +269,34 @@ Supported node classes:
 - experiment;
 - conditional branch;
 - join/merge;
+- loop;
 - terminal/outcome recorder.
 
 The workflow engine owns execution state, retries, idempotency, compensation where defined, and legal transitions.
 
-The graph may branch and execute independent nodes in parallel.
+The graph may branch and execute independent nodes in parallel. Cycles require an explicit bounded loop contract.
 
-## 10. Execution
+## 11. Task and Execution
 
-Execution is a concrete run of a Workflow Task or Workflow instance.
+A Task is a governed unit of work produced by a Workflow Node. An Execution is one concrete attempt/operation identity for a Task according to the frozen execution semantics. A logical Task must not be duplicated by retries.
 
 Execution contains:
 
 - execution identity;
 - client/workspace;
-- originating workflow/node;
+- originating deployment/workflow/node/version references;
 - participant/capability;
 - policy snapshot;
 - runtime class;
 - input/output references;
-- start/completion state;
+- lifecycle state;
 - evidence references;
 - cost/latency telemetry;
 - audit correlation.
 
 Execution is the unit that acquires runtime resources.
 
-## 11. Agent
+## 12. Agent
 
 Agent is a logical reusable capability with:
 
@@ -274,17 +309,45 @@ Agent is a logical reusable capability with:
 - evaluation policy;
 - action permissions.
 
-An Agent does not own tenant data, workflow state, or infrastructure.
+An Agent does not own tenant data, workflow state, deployment state, or infrastructure.
 
-## 12. Runtime and sandbox
+## 13. Human Agents and Jobs
+
+Human Agent is the generic human execution participant. Field Agent and other operational roles are specializations expressed as capabilities/metadata.
+
+A Job is a governed projection of a Task suitable for human execution. Jobs use candidate-specific Offers and the existing concurrency-safe acceptance contract.
+
+```text
+Goal
+ ↓
+Strategy / Workflow
+ ↓
+Task
+ ↓
+Eligibility / matching
+ ↓
+Job Offer
+ ↓
+Human Agent accepts
+ ↓
+Execution
+ ↓
+Evidence / Outcome
+```
+
+Human Agents may be agency staff or platform-pool participants. Every Job/Execution is scoped to exactly one commissioning Agency and Client.
+
+## 14. Runtime and sandbox
 
 The default runtime uses pooled workers.
 
 A sandbox is allocated only where the execution requires process/filesystem/browser persistence or isolation.
 
 ```text
-Workflow → Execution → Runtime Class → Worker or Sandbox
+Workflow → Task → Execution → Runtime Class → Worker or Sandbox Lease
 ```
+
+Persistent sandboxes are Workspace-scoped environments. Executions lease them; `execution_id` is never Sandbox identity.
 
 Sandbox classes:
 
@@ -294,33 +357,7 @@ Sandbox classes:
 
 The sandbox cannot create a second Execution identity and cannot bypass policy/authorization. Credentials are injected just-in-time through the credential boundary and are not persisted in normal execution payloads.
 
-## 13. Field agents and jobs
-
-Field Agent is a human execution role. A Job is a governed projection of a Task suitable for human acceptance.
-
-```text
-Goal
- ↓
-Strategy / Workflow
- ↓
-Task: visit prospect
- ↓
-Eligibility / matching
- ↓
-Job offer
- ↓
-Field Agent accepts
- ↓
-Execution
- ↓
-Evidence / outcome
-```
-
-Matching considers geography/territory, availability, capability, reliability, relationship continuity, and agency/client policy.
-
-Field agents may be agency-owned staff or participants from the platform pool.
-
-## 14. Evidence graph
+## 15. Evidence graph
 
 Evidence entities relate source facts to claims and outcomes:
 
@@ -340,19 +377,9 @@ Outcome
 Learning
 ```
 
-Evidence includes:
+Evidence includes source, observed timestamp, source timestamp where different, provenance, actor, content/hash/reference, evidence quality, applicability scope, and supersession/contradiction links where relevant.
 
-- source;
-- observed timestamp;
-- source timestamp where different;
-- provenance;
-- actor;
-- content/hash/reference;
-- evidence quality;
-- applicability scope;
-- supersession/contradiction links where relevant.
-
-## 15. Measurement and experiments
+## 16. Measurement and experiments
 
 Metrics are observations. Experiments are explicit causal/decision structures.
 
@@ -372,24 +399,15 @@ An Experiment declares:
 
 Attribution, prediction, and causal effect estimates are separate fields/types.
 
-## 16. Learning
+## 17. Learning
 
 Learning is a durable conclusion linked to the evidence supporting it and the conditions under which it applies.
 
-Learning must preserve:
-
-- statement;
-- supporting evidence;
-- confidence/uncertainty;
-- evidence quality;
-- scope/applicability;
-- discovered date;
-- last validated date;
-- contradicted/superseded status.
+Learning must preserve statement, supporting evidence, confidence/uncertainty, evidence quality, scope/applicability, discovered date, last validated date, and contradicted/superseded status.
 
 Learning may seed future hypotheses but never bypasses current validation when a decision requires current evidence.
 
-## 17. AI Runtime
+## 18. AI Runtime
 
 The AI Runtime is provider-neutral and receives a `TaskProfile` rather than a raw provider request.
 
@@ -413,44 +431,23 @@ The router can call direct providers, an aggregator such as OpenRouter, or self-
 
 Routing is a control-plane function, not domain logic.
 
-## 18. Extensions
+## 19. Extensions and Domain Packs
 
-Extensions are versioned capabilities that may add:
+Extensions are versioned capabilities that may add integrations, discovery/research, data connectors, execution actions, measurement providers, specialized AI capabilities, UI surfaces, and field/acquisition capabilities.
 
-- integrations;
-- discovery/research;
-- data connectors;
-- execution actions;
-- measurement providers;
-- specialized AI capabilities;
-- UI surfaces;
-- field/acquisition capabilities.
+Domain Packs are versioned composition layers. They may provide domain entities/views, goals/metrics, playbooks/workflow templates, capability definitions, policies, evidence schemas, evaluators and UI surfaces, but must use the core tenant, workflow, execution, evidence, AI, credential, policy, audit and Job authorities.
 
-Extensions declare permissions, required secrets, network access, data scopes, runtime class, events, inputs, outputs, and version compatibility.
+Creator Operations is a Domain Pack. Provider-specific creator APIs/SDKs/browser automation/scraping remain behind Integration/Extension boundaries.
 
-## 19. Integration boundary
+## 20. Integration boundary
 
 External providers are represented through normalized interfaces. Provider-specific APIs/SDKs live behind adapters/extensions.
 
-Examples:
+Examples include Meta Ads, Google Ads, GA4, Search Console, HubSpot, Salesforce, Shopify/WooCommerce, WordPress/CMS, email providers, social platforms, call tracking, creator platforms, scraping providers, and mapping/geo services.
 
-- Meta Ads
-- Google Ads
-- GA4
-- Search Console
-- HubSpot
-- Salesforce
-- Shopify/WooCommerce
-- WordPress/CMS
-- email providers
-- social platforms
-- call tracking
-- scraping providers
-- mapping/geo services
+No provider is the system of record for MarketingOS workflow, deployment, evidence, policy, or execution state.
 
-No provider is the system of record for MarketingOS workflow state.
-
-## 20. Data architecture
+## 21. Data architecture
 
 Initial topology:
 
@@ -458,7 +455,7 @@ Initial topology:
                 PostgreSQL
         ┌──────────┼───────────┐
         │          │           │
-     Domain     Workflow    Evidence
+     Domain     Workflow   Deployments
         │          │           │
         └──────────┼───────────┘
                    │
@@ -472,9 +469,9 @@ Initial topology:
        normalized events / reporting
 ```
 
-The analytics/warehouse layer is a read/analytics subsystem and cannot become an alternate workflow authority.
+The analytics/warehouse layer is a read/analytics subsystem and cannot become an alternate workflow or deployment authority.
 
-## 21. Security architecture
+## 22. Security architecture
 
 Security is layered:
 
@@ -487,9 +484,9 @@ Security is layered:
 7. evidence/audit;
 8. provider-specific security.
 
-A workflow may not infer authorization from identity, and an agent may not infer authorization from tool availability.
+A workflow or Deployment may not infer authorization from identity, and an agent may not infer authorization from tool availability.
 
-## 22. API and eventing
+## 23. API and eventing
 
 Mutations are server-authoritative. Long-running operations are asynchronous.
 
@@ -501,18 +498,18 @@ Provider webhook
  → persist event
  → enqueue
  → deterministic handler
- → workflow/evidence mutation
+ → workflow/evidence/deployment mutation
 ```
 
 Event processing is idempotent.
 
-## 23. Observability
+## 24. Observability
 
-Every execution and material workflow operation carries a correlation ID. AI usage includes model/provider, request class, tokens/compute where available, cost estimate/actual where authoritative, latency, evaluator outcome, and escalation count.
+Every deployment, execution and material workflow operation carries a correlation ID. AI usage includes model/provider, request class, tokens/compute where available, cost estimate/actual where authoritative, latency, evaluator outcome, and escalation count.
 
 Observability is never treated as an execution success verdict.
 
-## 24. UI
+## 25. UI
 
 The frontend is a consumer of authoritative backend state.
 
@@ -521,35 +518,33 @@ Primary user surfaces:
 - Agency Command Center;
 - Client Decision Room;
 - Goal/Strategy/Playbook workspace;
+- Deployment Center;
 - Workflow/Execution timeline;
 - Evidence Explorer;
 - Experiment Lab;
-- Field Agent mobile/web work queue;
+- Human Agent work queue;
 - Extension Developer Portal;
 - AI Runtime observability/policy console.
 
-The frontend owns presentation only, not workflow/authorization authority.
+The frontend owns presentation only, not workflow, deployment, or authorization authority.
 
-## 25. Deployment topology
-
-Preferred product topology:
+## 26. Infrastructure model
 
 ```text
-Vercel-like frontend/application edge
-        │
-        ▼
-MarketingOS Control Plane
-        │
-        ├── pooled workers
-        ├── queues/event processing
-        ├── AI Runtime
-        ├── analytics pipeline
-        └── sandbox service
-              ├── ephemeral
-              ├── persistent
-              └── dedicated
+Vercel-class web experience / edge
+              │
+              ▼
+      MarketingOS Control Plane
+              │
+      ┌───────┼──────────┬──────────┐
+      ▼       ▼          ▼          ▼
+   workers  queues     AI Runtime  sandbox service
+      │                              │
+      └──────────────┬───────────────┘
+                     ▼
+                data / storage
 ```
 
-AWS is the preferred class of substrate for the runtime/data/control infrastructure because the architecture needs queues, durable workers, network policy, secrets, sandboxing, enterprise isolation, and long-running compute. A Vercel-class platform is preferred for the web experience and rapid frontend delivery, not as the entire runtime substrate.
+AWS is the preferred class of substrate for the runtime/data/control infrastructure because the architecture needs durable queues/workers, network policy, secrets, sandboxing, enterprise isolation, and long-running compute. A Vercel-class platform is preferred for the web experience and rapid frontend delivery, not as the entire runtime substrate.
 
-The exact AWS service topology is implementation detail and is not frozen to one vendor product name beyond the architectural capability requirements.
+The exact AWS service topology remains an implementation decision subject to the frozen capability requirements.
