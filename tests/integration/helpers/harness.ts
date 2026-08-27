@@ -43,10 +43,14 @@ export async function migrate(databaseUrl: string): Promise<void> {
 }
 
 /** Spawns the API entrypoint on an EPHEMERAL port; resolves once it logs api.started. */
-export async function spawnApi(env: TestStackEnv): Promise<SpawnedProcess & { port: number }> {
+export async function spawnApi(
+  env: TestStackEnv,
+  extraEnv: Record<string, string> = {},
+): Promise<SpawnedProcess & { port: number }> {
   const child = spawnNode(['src/entrypoints/api.ts'], env, {
     MOS_HTTP_PORT: '0',
     MOS_LOG_LEVEL: 'info',
+    ...extraEnv,
   });
   const started = await waitForLine(child, (line) => line.includes('"api.started"'), 60_000);
   const port = extractPort(started);
@@ -195,6 +199,8 @@ export interface ApiCallOptions {
   readonly correlationId?: string | undefined;
   readonly method?: string | undefined;
   readonly body?: unknown | undefined;
+  /** Extra request headers (e.g. forged-header security probes). */
+  readonly headers?: Record<string, string> | undefined;
 }
 
 export interface ApiCallResult {
@@ -204,7 +210,7 @@ export interface ApiCallResult {
 }
 
 export async function apiCall(port: number, pathName: string, options: ApiCallOptions = {}): Promise<ApiCallResult> {
-  const headers: Record<string, string> = {};
+  const headers: Record<string, string> = { ...(options.headers ?? {}) };
   if (options.token !== undefined) headers['authorization'] = `Bearer ${options.token}`;
   if (options.correlationId !== undefined) headers['x-correlation-id'] = options.correlationId;
   if (options.body !== undefined) headers['content-type'] = 'application/json';

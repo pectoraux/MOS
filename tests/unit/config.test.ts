@@ -137,6 +137,130 @@ test('all problems are reported together', () => {
   }
 });
 
+// --- MKT-002 additions: user-session TTL + optional bootstrap platform administrator ---
+
+test('MKT-002 defaults: 12-hour session TTL and no bootstrap admin when unset', () => {
+  const config = loadConfig({ MOS_DATABASE_URL: VALID_URL });
+
+  assert.equal(config.authSessionTtlMs, 43_200_000, 'default session TTL is 12 hours');
+  assert.equal(config.bootstrapAdminEmail, '', 'no bootstrap admin by default');
+  assert.equal(config.bootstrapAdminPassword, '');
+
+  // Empty-string values fall back to the same defaults (platform env convention).
+  const blanked = loadConfig({
+    MOS_DATABASE_URL: VALID_URL,
+    MOS_AUTH_SESSION_TTL_MS: '',
+    MOS_BOOTSTRAP_PLATFORM_ADMIN_EMAIL: '',
+    MOS_BOOTSTRAP_PLATFORM_ADMIN_PASSWORD: '',
+  });
+  assert.equal(blanked.authSessionTtlMs, 43_200_000);
+  assert.equal(blanked.bootstrapAdminEmail, '');
+  assert.equal(blanked.bootstrapAdminPassword, '');
+});
+
+test('MOS_AUTH_SESSION_TTL_MS accepts explicit overrides, including both bounds', () => {
+  assert.equal(
+    loadConfig({ MOS_DATABASE_URL: VALID_URL, MOS_AUTH_SESSION_TTL_MS: '3600000' }).authSessionTtlMs,
+    3_600_000,
+  );
+  assert.equal(
+    loadConfig({ MOS_DATABASE_URL: VALID_URL, MOS_AUTH_SESSION_TTL_MS: '60000' }).authSessionTtlMs,
+    60_000,
+    'the minimum TTL (60s) is accepted',
+  );
+  assert.equal(
+    loadConfig({ MOS_DATABASE_URL: VALID_URL, MOS_AUTH_SESSION_TTL_MS: '2592000000' }).authSessionTtlMs,
+    2_592_000_000,
+    'the maximum TTL (30 days) is accepted',
+  );
+});
+
+test('MOS_AUTH_SESSION_TTL_MS rejects below-min, above-max and non-integer values', () => {
+  assertConfigProblem(
+    { MOS_DATABASE_URL: VALID_URL, MOS_AUTH_SESSION_TTL_MS: '59999' },
+    'MOS_AUTH_SESSION_TTL_MS must be an integer between 60000 and 2592000000',
+  );
+  assertConfigProblem(
+    { MOS_DATABASE_URL: VALID_URL, MOS_AUTH_SESSION_TTL_MS: '-60000' },
+    'MOS_AUTH_SESSION_TTL_MS must be an integer between 60000 and 2592000000',
+  );
+  assertConfigProblem(
+    { MOS_DATABASE_URL: VALID_URL, MOS_AUTH_SESSION_TTL_MS: '2592000001' },
+    'MOS_AUTH_SESSION_TTL_MS must be an integer between 60000 and 2592000000',
+  );
+  assertConfigProblem(
+    { MOS_DATABASE_URL: VALID_URL, MOS_AUTH_SESSION_TTL_MS: '12.5' },
+    'MOS_AUTH_SESSION_TTL_MS must be an integer between 60000 and 2592000000',
+  );
+  assertConfigProblem(
+    { MOS_DATABASE_URL: VALID_URL, MOS_AUTH_SESSION_TTL_MS: 'twelve-hours' },
+    'MOS_AUTH_SESSION_TTL_MS must be an integer between 60000 and 2592000000',
+  );
+});
+
+test('bootstrap platform admin credentials are both-or-neither: setting exactly one fails', () => {
+  assertConfigProblem(
+    { MOS_DATABASE_URL: VALID_URL, MOS_BOOTSTRAP_PLATFORM_ADMIN_EMAIL: 'admin@example.com' },
+    'MOS_BOOTSTRAP_PLATFORM_ADMIN_EMAIL and MOS_BOOTSTRAP_PLATFORM_ADMIN_PASSWORD must be set together',
+  );
+  assertConfigProblem(
+    { MOS_DATABASE_URL: VALID_URL, MOS_BOOTSTRAP_PLATFORM_ADMIN_PASSWORD: 'a-sufficiently-long-password' },
+    'MOS_BOOTSTRAP_PLATFORM_ADMIN_EMAIL and MOS_BOOTSTRAP_PLATFORM_ADMIN_PASSWORD must be set together',
+  );
+  // A whitespace-only email normalizes to empty, so the pair still fails
+  // closed as "password only" — no accidental bootstrap with no usable email.
+  assertConfigProblem(
+    {
+      MOS_DATABASE_URL: VALID_URL,
+      MOS_BOOTSTRAP_PLATFORM_ADMIN_EMAIL: '   ',
+      MOS_BOOTSTRAP_PLATFORM_ADMIN_PASSWORD: 'a-sufficiently-long-password',
+    },
+    'MOS_BOOTSTRAP_PLATFORM_ADMIN_EMAIL and MOS_BOOTSTRAP_PLATFORM_ADMIN_PASSWORD must be set together',
+  );
+});
+
+test('a valid bootstrap admin pair is exposed with the email normalized (trimmed + lowercased)', () => {
+  const config = loadConfig({
+    MOS_DATABASE_URL: VALID_URL,
+    MOS_BOOTSTRAP_PLATFORM_ADMIN_EMAIL: '  Admin@Example.COM  ',
+    MOS_BOOTSTRAP_PLATFORM_ADMIN_PASSWORD: 'Correct-Horse-Battery-9',
+  });
+
+  assert.equal(config.bootstrapAdminEmail, 'admin@example.com', 'email is trimmed and lowercased');
+  assert.equal(
+    config.bootstrapAdminPassword,
+    'Correct-Horse-Battery-9',
+    'the password is exposed verbatim (never normalized or trimmed)',
+  );
+});
+
+test('the bootstrap admin password must be at least 12 characters when the pair is set', () => {
+  assertConfigProblem(
+    {
+      MOS_DATABASE_URL: VALID_URL,
+      MOS_BOOTSTRAP_PLATFORM_ADMIN_EMAIL: 'admin@example.com',
+      MOS_BOOTSTRAP_PLATFORM_ADMIN_PASSWORD: 'short',
+    },
+    'MOS_BOOTSTRAP_PLATFORM_ADMIN_PASSWORD must be at least 12 characters',
+  );
+  // Boundary: 11 characters still fails, 12 characters loads.
+  assertConfigProblem(
+    {
+      MOS_DATABASE_URL: VALID_URL,
+      MOS_BOOTSTRAP_PLATFORM_ADMIN_EMAIL: 'admin@example.com',
+      MOS_BOOTSTRAP_PLATFORM_ADMIN_PASSWORD: 'a'.repeat(11),
+    },
+    'MOS_BOOTSTRAP_PLATFORM_ADMIN_PASSWORD must be at least 12 characters',
+  );
+  const boundary = loadConfig({
+    MOS_DATABASE_URL: VALID_URL,
+    MOS_BOOTSTRAP_PLATFORM_ADMIN_EMAIL: 'admin@example.com',
+    MOS_BOOTSTRAP_PLATFORM_ADMIN_PASSWORD: 'a'.repeat(12),
+  });
+  assert.equal(boundary.bootstrapAdminPassword, 'a'.repeat(12));
+  assert.equal(boundary.bootstrapAdminEmail, 'admin@example.com');
+});
+
 test('loadConfig never reads process.env when an env object is passed', () => {
   const keys = ['MOS_DATABASE_URL', 'MOS_LOG_LEVEL', 'MOS_HTTP_PORT'] as const;
   const saved = keys.map((key) => process.env[key]);

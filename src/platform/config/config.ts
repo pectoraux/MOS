@@ -6,6 +6,11 @@
  * process fails fast on invalid values — no silent defaults for security-
  * relevant settings (the internal API token defaults to unset, which makes
  * authenticated routes fail closed).
+ *
+ * MKT-002 additions: user-session TTL and the optional (both-or-neither)
+ * bootstrap platform administrator. The bootstrap credential is start-time
+ * configuration only — it is never persisted as raw material; only the
+ * scrypt verifier lands in the auth-owned credential store.
  */
 
 import { ConfigError } from '../errors/errors.ts';
@@ -33,6 +38,12 @@ export interface AppConfig {
   readonly objectStoreDir: string;
   /** Bearer token for the platform HTTP authenticator; empty = fail closed. */
   readonly internalApiToken: string;
+  /** User session lifetime in milliseconds (MKT-002 /auth sessions). */
+  readonly authSessionTtlMs: number;
+  /** Bootstrap platform administrator email; empty = no bootstrap. */
+  readonly bootstrapAdminEmail: string;
+  /** Bootstrap platform administrator initial password; empty = no bootstrap. */
+  readonly bootstrapAdminPassword: string;
   /** Worker identity label; empty = generated at startup. */
   readonly workerId: string;
   /** Worker poll interval in milliseconds. */
@@ -70,6 +81,19 @@ export function loadConfig(env: Env = process.env): AppConfig {
   const objectStoreDir = env['MOS_OBJECT_STORE_DIR'] ?? './var/objects';
 
   const internalApiToken = env['MOS_INTERNAL_API_TOKEN'] ?? '';
+
+  const authSessionTtlMs = readInt(env, 'MOS_AUTH_SESSION_TTL_MS', 12 * 60 * 60 * 1000, 60_000, 2_592_000_000, problems);
+
+  const bootstrapAdminEmail = (env['MOS_BOOTSTRAP_PLATFORM_ADMIN_EMAIL'] ?? '').trim().toLowerCase();
+  const bootstrapAdminPassword = env['MOS_BOOTSTRAP_PLATFORM_ADMIN_PASSWORD'] ?? '';
+  if ((bootstrapAdminEmail === '') !== (bootstrapAdminPassword === '')) {
+    problems.push(
+      'MOS_BOOTSTRAP_PLATFORM_ADMIN_EMAIL and MOS_BOOTSTRAP_PLATFORM_ADMIN_PASSWORD must be set together (both or neither)',
+    );
+  } else if (bootstrapAdminPassword !== '' && bootstrapAdminPassword.length < 12) {
+    problems.push('MOS_BOOTSTRAP_PLATFORM_ADMIN_PASSWORD must be at least 12 characters when set');
+  }
+
   const workerId = env['MOS_WORKER_ID'] ?? '';
   const workerPollIntervalMs = readInt(env, 'MOS_WORKER_POLL_INTERVAL_MS', 500, 1, 60_000, problems);
   const workerBatchSize = readInt(env, 'MOS_WORKER_BATCH_SIZE', 5, 1, 100, problems);
@@ -90,6 +114,9 @@ export function loadConfig(env: Env = process.env): AppConfig {
     objectStore,
     objectStoreDir,
     internalApiToken,
+    authSessionTtlMs,
+    bootstrapAdminEmail,
+    bootstrapAdminPassword,
     workerId,
     workerPollIntervalMs,
     workerBatchSize,
