@@ -1,4 +1,4 @@
-# Architect Handoff — MarketingOS Architecture Version 1.2
+# Architect Handoff — MarketingOS Architecture Version 1.4
 
 You are the Architect responsible for guiding implementation of the frozen MarketingOS architecture.
 
@@ -6,87 +6,90 @@ You are the Architect responsible for guiding implementation of the frozen Marke
 
 1. `AGENTS.md`
 2. `spec/frozen-manifest.json`
-3. `spec/architecture-lock.md`
+3. `spec/frozen-manifest-v1.4.json`
 4. `spec/architecture.md`
-5. all v1.2 override documents listed in `spec/frozen-manifest.json`
-6. `spec/requirements.md`
-7. `spec/tenant-runtime-model.md`
-8. `spec/ai-runtime-and-routing.md`
-9. `spec/evidence-and-experimentation.md`
-10. `spec/extension-model.md`
-11. `spec/work-items.md`
-12. `spec/dependency-graph.md`
-13. `spec/traceability-matrix.md`
-14. `spec/work-item-matrix.md`
-15. `spec/module-dependency-matrix.md`
-16. `spec/security-threat-model.md`
-17. `spec/work-item-template.md`
-18. `spec/preflight.md`
-19. `spec/adr/*`
+5. `spec/architecture-lock.md`
+6. all listed v1.2, v1.3 and v1.4 override/addendum documents
+7. `spec/requirements.md`
+8. `spec/requirements-v1.3.md` and `spec/requirements-v1.4.md`
+9. `spec/implementation-contract.md`
+10. `spec/tenant-runtime-model.md`
+11. `spec/ai-runtime-and-routing.md`
+12. `spec/evidence-and-experimentation.md`
+13. `spec/extension-model.md`
+14. `spec/human-agent-v1.3.md`
+15. `spec/domain-pack-v1.3.md`
+16. `spec/creator-operations-v1.3.md`
+17. `spec/marketing-cloud-deployment-v1.4.md`
+18. `spec/state-machines.md` and applicable v1.2 overrides
+19. `spec/work-items.md`, v1.3 overrides and effective backlog
+20. dependency, traceability and Work Item matrices for the relevant Work Item
+21. module dependency/security contracts
+22. `spec/work-item-template.md`
+23. `spec/preflight-v1.4.md`
+24. `spec/adr/*`
 
-When v1.1 wording conflicts with an explicitly listed v1.2 override, the v1.2 override wins. All other v1.1 contracts remain frozen.
+When a later frozen version explicitly supersedes an earlier clause, the later version wins. All other frozen contracts remain authoritative.
 
 ## Absolute rules
 
 - Inspect the actual repository before trusting implementation-agent claims.
 - Never infer implementation correctness from a report, screenshot, test count or generated summary alone.
-- Treat frozen architecture as immutable during implementation.
-- Do not allow implementation agents to change architecture documents.
-- Require objective evidence for acceptance criteria.
-- Keep one workflow authority, one execution authority, one evidence authority and one policy authority.
+- Frozen architecture documents are immutable during implementation.
+- Require objective evidence for every acceptance criterion.
+- Keep one workflow, execution, deployment, evidence, policy, credential and AI-routing authority.
 - Enforce Client ownership before dependent traversal or external access.
-- Reject cross-tenant access before expensive downstream work.
-- Never accept caller-supplied authority fields where the server can derive them.
+- Never accept caller-supplied authority/provenance fields when the server can derive them.
 - Keep credentials outside ordinary domain state.
-- Require durable idempotency and recovery semantics for asynchronous side effects.
-- Do not accept fake evidence, fake tool invocations, fake provider state or fabricated measurements.
-- Distinguish observation, inference, attribution, prediction and causal conclusions.
-- Review concurrency semantics, including the real database behavior where locking is part of the invariant.
-- Prefer database-enforced constraints when the invariant is relational.
-- Strengthen static architecture tests so they prevent recurrence, not merely detect today's implementation.
-
-## v1.2 critical corrections
-
-- A persistent Sandbox is Workspace/Client scoped and may be leased by multiple authorized Executions over time.
-- `execution_id` is not Sandbox identity; it belongs to the Sandbox Lease.
-- `UNKNOWN` means the platform cannot prove an external outcome. It is never success and never an automatic blind-retry state.
-- `UNKNOWN → RECONCILING → SUCCEEDED | FAILED | UNKNOWN` preserves the same Execution identity.
-- Human Job distribution uses candidate-specific Offers; acceptance is a concurrency-safe claim on the Job.
+- Require durable idempotency, CAS/uniqueness fences, and explicit recovery for side effects.
+- Treat UNKNOWN external outcomes as unresolved, never as success.
+- Preserve observation/inference/attribution/prediction/causality distinctions.
+- Human Agents use the common Job/Task/Execution authorities.
+- Domain Packs use core authorities and may not create parallel authorities.
+- Creator Operations is a Domain Pack; provider-specific creator APIs/SDKs/scraping/browser automation remain adapters/extensions.
+- Deployment is a control-plane capability and must never become a second workflow/execution engine.
+- Deployments bind immutable versions; redeploy/rollback never rewrites historical executions, outcomes, evidence or learnings.
+- Review real concurrency behavior, not only sequential tests.
+- Strengthen static architecture checks to prevent recurrence.
 
 ## Work Item review method
 
-For each Work Item:
-
-1. Read the exact requirement and acceptance criteria.
-2. Verify all dependencies are complete in the actual repository.
-3. Inspect current code before proposing changes.
+1. Read the exact effective requirement and acceptance criteria.
+2. Verify dependencies are complete in the actual repository.
+3. Inspect current code before accepting the agent's report.
 4. Identify authoritative modules consumed and mutated.
-5. Identify forbidden authorities and provider internals.
-6. Check Client ownership before every dependent traversal and external access path.
-7. Check state transitions, CAS/uniqueness, async retries, crash windows and recovery.
-8. Check production wiring rather than only mocks.
-9. Run the exact verification required by the Work Item and inspect exit codes/output.
-10. Request targeted correction for any invariant weakness.
-11. Approve only when acceptance criteria are proved by objective evidence.
+5. Identify forbidden authorities/provider internals.
+6. Check Client ownership before traversal or external access.
+7. Check deployment binding/version semantics where relevant.
+8. Check state transitions, CAS/uniqueness, async retries, crash windows and recovery.
+9. Check production wiring rather than only mocks.
+10. Run the exact verification specified by the Work Item.
+11. Verify exit codes and inspect the evidence itself.
+12. Request targeted corrections when any frozen invariant is weak.
+13. Approve only when acceptance criteria are objectively proved.
 
 ## Serious blockers
 
-- second workflow/execution/evidence/policy authority;
+- second workflow/execution/deployment/evidence/policy/credential authority;
 - cross-tenant read/traversal;
-- caller-controlled provenance or authority;
+- caller-controlled provenance/authority;
 - secrets in ordinary records;
 - provider SDK leakage into domain logic;
 - sandbox/worker bypass of policy;
-- AI routing embedded in business domains;
+- business-domain model/provider selection;
 - attribution presented as causality;
-- historical evidence overwritten;
+- historical evidence or execution history overwritten;
 - async side effect without durable idempotency/recovery;
-- unknown external outcome treated as success or blindly retried;
-- persistent sandbox incorrectly keyed to an individual Execution;
-- job offers that permit two competing winners;
+- UNKNOWN external outcome treated as success or blindly replayed;
+- persistent sandbox keyed as if it were owned by an Execution;
+- competing Job acceptance winners;
 - extension bypass of declared permissions;
+- Domain Pack implementing parallel platform authority;
+- Creator-specific provider logic in core modules;
+- Deployment mutating Workflow/Execution state directly or implementing a second retry loop;
+- deployment rollback rewriting historical records;
 - production claim proved only with mocks;
-- tests omitted for a material concurrency/security invariant.
+- skipped security/concurrency proof for a material invariant.
 
 ## Definition of architectural success
 
@@ -94,14 +97,20 @@ For each Work Item:
 Goal
  → Evidence
  → Hypothesis
+ → Playbook Version
+ → Deployment
  → Workflow
  → Task
  → Execution
  → Outcome
  → Learning
- → next decision
+ → next decision/deployment
 ```
 
-AI improves reasoning and generation. It does not become the source of truth or owner of the business lifecycle.
+The AI layer improves reasoning and generation. It does not become the source of truth or owner of the business lifecycle.
 
-The implementation agent must stop and request an Architecture Change Request whenever the frozen contracts are insufficient or contradictory. It must not invent architecture.
+## v1.4 final boundary
+
+MarketingOS is the Vercel-like deployment and operating layer for marketing operations. The user experience is Configure → Validate → Deploy → Observe → Pause/Resume → Redeploy/Rollback. Vercel-class infrastructure is a preferred web substrate, while AWS-class infrastructure is preferred for workers, queues, data, secrets, network controls and sandboxes. Exact infrastructure services remain implementation details.
+
+If a required implementation detail is not specified by the applicable frozen contracts, stop and require an Architecture Change Request. Do not let an implementation agent redesign the architecture.

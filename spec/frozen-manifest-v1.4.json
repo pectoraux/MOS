@@ -1,0 +1,24 @@
+{
+  "project": "MarketingOS",
+  "architecture_version": "1.4",
+  "status": "FROZEN",
+  "supersedes_manifest": "spec/frozen-manifest.json",
+  "primary_architecture": "spec/architecture.md",
+  "required_v1_4_documents": [
+    "spec/change-request-004.md",
+    "spec/marketing-cloud-deployment-v1.4.md",
+    "spec/architecture-lock-v1.4.md",
+    "spec/requirements-v1.4.md",
+    "spec/preflight-v1.4.md"
+  ],
+  "new_requirement": "DEPLOY-002",
+  "invariants": [
+    "single_deployment_authority",
+    "deployment_binds_immutable_versions",
+    "deployment_does_not_execute_workflow_directly",
+    "redeploy_does_not_rewrite_history",
+    "rollback_selects_immutable_approved_version",
+    "persistent_sandbox_is_workspace_scoped",
+    "sandbox_lease_is_execution_scoped"
+  ]
+}
