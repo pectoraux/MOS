@@ -43,7 +43,8 @@ export function auditActor(principal: Principal): string {
  * workspace/goal/workflow owners. Playbooks carry no workspace scope (the
  * frozen ownership matrix scopes a Playbook to an Agency or a Client);
  * workflows are Workspace-scoped (the scope chain ends
- * Agency → Client → Workspace → Workflow).
+ * Agency → Client → Workspace → Workflow); executions are Workspace-scoped
+ * the same way (Agency → Client → Workspace → Execution).
  */
 function ownerScopeAuditFields(owner: OwnerScope): {
   agencyId: string | null;
@@ -62,7 +63,9 @@ function ownerScopeAuditFields(owner: OwnerScope): {
           ? owner.clientId
           : owner.kind === 'workflow'
             ? owner.clientId
-            : null,
+            : owner.kind === 'execution'
+              ? owner.clientId
+              : null,
     workspaceId:
       owner.kind === 'workspace'
         ? owner.workspaceId
@@ -70,7 +73,9 @@ function ownerScopeAuditFields(owner: OwnerScope): {
           ? owner.workspaceId
           : owner.kind === 'workflow'
             ? owner.workspaceId
-            : null,
+            : owner.kind === 'execution'
+              ? owner.workspaceId
+              : null,
   };
 }
 

@@ -1,6 +1,6 @@
 /**
  * Application-level module wiring contract (MKT-002, MKT-003, MKT-004,
- * MKT-005, MKT-006, MKT-007, MKT-008).
+ * MKT-005, MKT-006, MKT-007, MKT-008, MKT-009, MKT-010).
  *
  * src/api route builders receive the domain modules through this interface —
  * the concrete instances are created ONLY in the composition root (which is
@@ -15,6 +15,11 @@
  * MKT-007 additions: /playbooks (Playbook versions, PLAY-001).
  *
  * MKT-008 additions: /workflows (Workflow definition graph model, WF-001).
+ *
+ * MKT-009 additions: /workflows (Workflow instance state machine,
+ * implementation-contract §5).
+ *
+ * MKT-010 additions: /executions (normalized Execution model, EXEC-001).
  */
 
 import type { AgenciesModuleApi } from '../modules/agencies/public.ts';
@@ -22,6 +27,7 @@ import type { AuditModuleApi } from '../modules/audit/public.ts';
 import type { AuthModuleApi } from '../modules/auth/public.ts';
 import type { ClientsModuleApi } from '../modules/clients/public.ts';
 import type { CredentialsModuleApi } from '../modules/credentials/public.ts';
+import type { ExecutionsModuleApi } from '../modules/executions/public.ts';
 import type { GoalsModuleApi } from '../modules/goals/public.ts';
 import type { PlaybooksModuleApi } from '../modules/playbooks/public.ts';
 import type { UsersModuleApi } from '../modules/users/public.ts';
@@ -39,4 +45,5 @@ export interface ApplicationModules {
   readonly goals: GoalsModuleApi;
   readonly playbooks: PlaybooksModuleApi;
   readonly workflows: WorkflowsModuleApi;
+  readonly executions: ExecutionsModuleApi;
 }

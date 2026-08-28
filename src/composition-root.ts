@@ -71,6 +71,27 @@
  *     (architecture.md §10/§11 — the instance machine is MKT-009,
  *     Executions are /executions MKT-010, deployment binding is
  *     /deployments MKT-040).
+ *
+ * MKT-009 additions:
+ *   - the /workflows module's INSTANCE sub-authority
+ *     (implementation-contract §5): the Workflow instance state machine —
+ *     identity pinning one immutable ACTIVE definition version, the frozen
+ *     DRAFT → READY → RUNNING lifecycle with CAS, idempotency-fenced
+ *     transitions and append-only history.
+ *
+ * MKT-010 additions:
+ *   - the /executions module is constructed here (dependency matrix:
+ *     /executions ──→ /workspaces) owning the NORMALIZED EXECUTION MODEL
+ *     (EXEC-001): one Execution identity and lifecycle for deterministic,
+ *     AI, human and extension execution — the actual runtime attempt with
+ *     its task linkage (reference data), the frozen
+ *     CREATED → QUEUED → STARTING → RUNNING machine with UNKNOWN/
+ *     RECONCILING reconciliation semantics, the §8 DB-fenced logical
+ *     idempotency key, the §24 retry classification with the explicit
+ *     retry gate, and the durable sandbox LEASE relationship. NO execution
+ *     ENGINE is wired: no dispatch, no queue consumption, no workers, no
+ *     sandbox lifecycle (MKT-011/MKT-012); /workflows does not call
+ *     /executions yet (that arrives with the runtime engine).
  */
 
 import fs from 'node:fs';
@@ -110,6 +131,7 @@ import { createAuditModule } from './modules/audit/public.ts';
 import { createGoalsModule } from './modules/goals/public.ts';
 import { createPlaybooksModule } from './modules/playbooks/public.ts';
 import { createWorkflowsModule } from './modules/workflows/public.ts';
+import { createExecutionsModule } from './modules/executions/public.ts';
 import type { ApplicationModules } from './api/application.ts';
 
 export interface AppOptions {
@@ -195,8 +217,11 @@ function buildCore(config: AppConfig, options: AppOptions): Core {
   // /audit import no other module — they take platform ports + plain data;
   // /goals → /clients, /workspaces; /playbooks → /agencies, /clients,
   // /goals; /workflows → /workspaces, /playbooks — the MKT-008 definition
-  // sub-authority: the Workspace ownership chain resolves server-side and
-  // the Playbook provenance link pins explicit playbook version ids).
+  // sub-authority plus the MKT-009 instance sub-authority: the Workspace
+  // ownership chain resolves server-side and the Playbook provenance link
+  // pins explicit playbook version ids; /executions → /workspaces — the
+  // MKT-010 normalized execution model: workspace-scoped runtime attempts
+  // whose canonical owner chain resolves server-side).
   const users = createUsersModule({ db, clock, ids });
   const auth = createAuthModule({
     db,
@@ -213,6 +238,7 @@ function buildCore(config: AppConfig, options: AppOptions): Core {
   const goals = createGoalsModule({ db, clock, ids, clients, workspaces });
   const playbooks = createPlaybooksModule({ db, clock, ids, agencies, clients, goals });
   const workflows = createWorkflowsModule({ db, clock, ids, workspaces, playbooks });
+  const executions = createExecutionsModule({ db, clock, ids, workspaces });
 
   // Authentication order: user sessions first, then the internal service
   // token. Every path fails closed (CompositeAuthenticator).
@@ -239,7 +265,7 @@ function buildCore(config: AppConfig, options: AppOptions): Core {
         metrics,
       },
     },
-    modules: { users, auth, agencies, clients, workspaces, credentials, audit, goals, playbooks, workflows },
+    modules: { users, auth, agencies, clients, workspaces, credentials, audit, goals, playbooks, workflows, executions },
   };
 }
 

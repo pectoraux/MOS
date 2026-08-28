@@ -414,6 +414,8 @@ test('MKT-005: migrations 005/006 exist with exactly the expected numbering (no 
     '009_workflows.sql',
     // MKT-009 appends the workflow instance state machine migration (010).
     '010_workflow_instances.sql',
+    // MKT-010 appends the normalized execution model migration (011).
+    '011_executions.sql',
   ]);
   // The object-store fs/memory/s3 adapter dirs each hold exactly one implementation.
   for (const dir of ['cache', 'locking', 'objects', 'secrets']) {
