@@ -20,7 +20,7 @@
 import type { Logger, Metrics } from '../platform/observability/contract.ts';
 import { withCorrelation } from '../platform/observability/correlation.ts';
 import type { JobRecord } from '../platform/queue/contract.ts';
-import { toAppError } from '../platform/errors/errors.ts';
+import { ConflictError, toAppError } from '../platform/errors/errors.ts';
 import type { JobErrorRecord } from '../platform/queue/contract.ts';
 
 export interface JobHandlerContext {
@@ -152,20 +152,9 @@ export class WorkerHost {
           return;
         }
 
+        let output: Record<string, unknown>;
         try {
-          const output = await handler({ job, logger: this.deps.logger });
-          const completed = await this.deps.complete(job.jobId, output, job.version);
-          this.deps.metrics.increment('platform_jobs_succeeded', { handler: job.handlerKind });
-          this.deps.metrics.observe('platform_job_duration_ms', this.deps.clock.nowMs() - startedMs, {
-            handler: job.handlerKind,
-            outcome: 'succeeded',
-          });
-          this.deps.logger.info('job.succeeded', undefined, {
-            job_id: job.jobId,
-            worker_id: this.options.workerId,
-            attempt: completed.attempts,
-            duration_ms: this.deps.clock.nowMs() - startedMs,
-          });
+          output = await handler({ job, logger: this.deps.logger });
         } catch (error) {
           const appError = toAppError(error);
           await this.failJob(job, {
@@ -178,7 +167,39 @@ export class WorkerHost {
             handler: job.handlerKind,
             outcome: 'failed',
           });
+          return;
         }
+
+        // Stale-claim recovery (MKT-011) can supersede an in-flight attempt:
+        // its claim expired and another worker re-claimed the job (version
+        // moved), so this worker's late completion hits the CAS guard. That
+        // is convergence, not a crash — the job is (or will be) processed by
+        // its new owner, and pooled handlers are idempotent by contract.
+        let completed: JobRecord;
+        try {
+          completed = await this.deps.complete(job.jobId, output, job.version);
+        } catch (error) {
+          if (!(error instanceof ConflictError)) throw error;
+          this.deps.metrics.increment('platform_jobs_superseded', { handler: job.handlerKind });
+          this.deps.logger.warn('job.superseded', undefined, {
+            job_id: job.jobId,
+            worker_id: this.options.workerId,
+            attempt: job.attempts,
+            note: 'late completion from a superseded claim discarded (job re-claimed by another worker)',
+          });
+          return;
+        }
+        this.deps.metrics.increment('platform_jobs_succeeded', { handler: job.handlerKind });
+        this.deps.metrics.observe('platform_job_duration_ms', this.deps.clock.nowMs() - startedMs, {
+          handler: job.handlerKind,
+          outcome: 'succeeded',
+        });
+        this.deps.logger.info('job.succeeded', undefined, {
+          job_id: job.jobId,
+          worker_id: this.options.workerId,
+          attempt: completed.attempts,
+          duration_ms: this.deps.clock.nowMs() - startedMs,
+        });
       },
     );
   }
@@ -190,7 +211,24 @@ export class WorkerHost {
       workerId: this.options.workerId,
       at: this.deps.clock.nowIso(),
     };
-    const updated = await this.deps.fail(job.jobId, record, job.version, this.options.retryBackoffBaseMs);
+    let updated;
+    try {
+      updated = await this.deps.fail(job.jobId, record, job.version, this.options.retryBackoffBaseMs);
+    } catch (error) {
+      if (error instanceof ConflictError) {
+        // Superseded by a stale-claim reclaim: the new owner owns the
+        // outcome; this late failure is discarded as convergence.
+        this.deps.metrics.increment('platform_jobs_superseded', { handler: job.handlerKind });
+        this.deps.logger.warn('job.superseded', undefined, {
+          job_id: job.jobId,
+          worker_id: this.options.workerId,
+          attempt: job.attempts,
+          note: 'late failure from a superseded claim discarded (job re-claimed by another worker)',
+        });
+        return;
+      }
+      throw error;
+    }
     if (updated.status === 'dead') {
       this.deps.metrics.increment('platform_jobs_dead', { handler: job.handlerKind });
       this.deps.logger.error('job.dead', record.message, {

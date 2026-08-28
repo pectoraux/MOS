@@ -568,6 +568,10 @@ export function createExecutionsModule(deps: ExecutionsModuleDeps): ExecutionsMo
     async listExecutionSandboxLeases(executionId) {
       return leases.listSandboxLeases(executionId);
     },
+
+    async listReclaimableSandboxLeases(beforeIso) {
+      return leases.listReclaimableSandboxLeases(beforeIso);
+    },
   };
 }
 

@@ -115,6 +115,7 @@ import { createLoggerFactory } from './platform/observability/logger.ts';
 import { InMemoryMetrics } from './platform/observability/metrics.ts';
 import { InternalTokenAuthenticator } from './platform/http/auth/adapters/internal-token/internal-token-authenticator.ts';
 import { CompositeAuthenticator } from './platform/http/auth/adapters/composite/composite-authenticator.ts';
+import { FetchHttpCall } from './platform/http/outbound-fetch.ts';
 import { ConfigError } from './platform/errors/errors.ts';
 import type { AppServices } from './platform/app-services.ts';
 import type { ObservabilitySink } from './platform/observability/contract.ts';
@@ -151,7 +152,7 @@ function buildCore(config: AppConfig, options: AppOptions): Core {
   const ids = new CryptoIdGenerator();
 
   const db = new PgDb(config.databaseUrl);
-  const queue = new PgQueue(db, () => ids.newId());
+  const queue = new PgQueue(db, () => ids.newId(), config.queueStaleClaimMs);
 
   // Object store: the MKT-001 port, now with the production S3-compatible
   // adapter behind the SAME contract (wired here only — consumers unchanged).
@@ -202,6 +203,10 @@ function buildCore(config: AppConfig, options: AppOptions): Core {
     ]);
   }
   const secrets = new FileSecretStore({ dir: config.secretsDir });
+
+  // Bounded provider-neutral outbound HTTP (MKT-011): the fetch transport
+  // wired here only — task runners depend on the HttpCallPort contract.
+  const httpCalls = new FetchHttpCall();
 
   const primarySink = options.primarySink ?? new ConsoleSink();
   const sink =
@@ -258,6 +263,7 @@ function buildCore(config: AppConfig, options: AppOptions): Core {
       cache,
       locks,
       secrets,
+      httpCalls,
       auth: authenticator,
       observability: {
         sink,

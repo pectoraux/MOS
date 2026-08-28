@@ -10,6 +10,8 @@
  *   POST   /api/executions/:executionId/sandbox-leases                      acquire the sandbox lease, idempotency-fenced (owner|admin|platform admin)
  *   GET    /api/executions/:executionId/sandbox-leases                      the leases ever held, oldest first (any active member)
  *   POST   /api/executions/:executionId/sandbox-leases/:leaseId/release     release a lease — idempotent, never terminalizes (owner|admin|platform admin)
+ *   POST   /api/executions/:executionId/dispatch                            MKT-011: hand the execution to the pooled worker path — transactional-outbox dispatch (owner|admin|platform admin)
+ *   GET    /api/executions/:executionId/dispatch                            the dispatch record + set-once run outcome (any active member)
  *
  * The Execution is the ACTUAL RUNTIME ATTEMPT identity (architecture.md
  * §11) — the transition from the MKT-009 Workflow Instance's lifecycle
@@ -55,6 +57,8 @@ import type { Router } from '../platform/http/router.ts';
 import { currentCorrelation } from '../platform/observability/correlation.ts';
 import {
   intField,
+  optionalInt,
+  optionalRecordField,
   optionalString,
   stringField,
   validateObject,
@@ -75,6 +79,11 @@ import type {
   RuntimeClass,
   SandboxLeaseRecord,
 } from '../modules/executions/public.ts';
+import { PooledRuntimeService } from '../workers/pooled/pooled-runtime.ts';
+import type {
+  DispatchOutcome,
+  ExecutionDispatchRecord,
+} from '../workers/pooled/contract.ts';
 
 const EXECUTION_KIND_PATTERN = /^(deterministic|ai|human|extension)$/;
 const RUNTIME_CLASS_PATTERN = /^(pooled-worker|ephemeral-sandbox|persistent-sandbox|dedicated-runtime)$/;
@@ -167,6 +176,36 @@ const LEASE_RELEASE_AUTHORITY_FIELDS = [
   'releasedAt',
   'expiresAt',
   'idempotencyKey',
+  'version',
+  'createdAt',
+  'updatedAt',
+] as const;
+
+/**
+ * Fields that are always runtime-derived on pooled DISPATCH (authority
+ * fields): the dispatch identity/lifecycle, the queue binding, the cycle,
+ * the set-once outcome evidence and the correlation/provenance capture are
+ * server-owned — a caller supplies the COMMAND, never the plumbing.
+ */
+const EXECUTION_DISPATCH_AUTHORITY_FIELDS = [
+  'dispatchId',
+  'executionId',
+  'workspaceId',
+  'clientId',
+  'agencyId',
+  'dispatchStatus',
+  'jobId',
+  'queueName',
+  'handlerKind',
+  'cycle',
+  'outcome',
+  'outputRef',
+  'output',
+  'outcomeReason',
+  'createFingerprint',
+  'correlationId',
+  'causationId',
+  'createdBy',
   'version',
   'createdAt',
   'updatedAt',
@@ -857,4 +896,172 @@ export function registerExecutionsRoutes(
       respond: (ctx) => jsonResponse(200, serializeLeaseReleaseOutcome(ctx.result)),
     }),
   );
+
+  // -------------------------------------------------------------------------
+  // MKT-011 — POST /api/executions/:executionId/dispatch — hand the
+  // execution to the POOLED WORKER PATH (RUNTIME-001 / RUNTIME-AC-01,
+  // EXEC-AC-03). The command records the transactional-outbox dispatch and
+  // applies created → queued through the single transition port; the
+  // runtime relay (worker process) submits the durable queue job; shared
+  // workers then drive the execution to a terminal verdict. Idempotent per
+  // the §8 fences: one dispatch per Execution identity (DB UNIQUE), a
+  // duplicate of the same command converges (200 replayed), any different
+  // dispatch command for the same execution is a 409. Dispatch is NEW USE:
+  // ACTIVE Workspace/Client/Agency boundaries required. Only
+  // runtime_class=pooled-worker executions dispatch here (sandbox classes
+  // acquire runtime environments through the MKT-012 sandbox authority).
+  // The task kind names a REGISTERED pooled runner (data/api classes in
+  // MKT-011); AI-class executions ride the same path (execution kind is
+  // orthogonal), genuine model invocation arriving with /ai-runtime.
+  // -------------------------------------------------------------------------
+  const pooled = new PooledRuntimeService({
+    db: services.db,
+    clock: services.clock,
+    ids: services.ids,
+    queue: services.queue,
+    executions: modules.executions,
+    logger: services.observability.loggerFactory.forModule('pooled.dispatch'),
+    metrics: services.observability.metrics,
+  });
+
+  router.add(
+    'POST',
+    '/api/executions/:executionId/dispatch',
+    defineMutationRoute<{ executionId: string }, DispatchOutcome>({
+      authenticator: services.auth,
+      resolveOwner: async (_ctx, params) => executionOwner(params.executionId),
+      authorize: async (ctx) => {
+        await requireExecutionAccess(modules, ctx.principal, ctx.params.executionId, [
+          'agency_owner',
+          'agency_admin',
+        ]);
+      },
+      validate: (ctx) =>
+        validateObject<{
+          taskKind: string;
+          idempotencyKey: string;
+          input: Record<string, unknown> | undefined;
+          inputRef: string | undefined;
+          maxAttempts: number | undefined;
+        }>(ctx.request.body, {
+          forbiddenKeys: EXECUTION_DISPATCH_AUTHORITY_FIELDS,
+          fields: {
+            taskKind: stringField({ minLength: 3, maxLength: 100 }),
+            idempotencyKey: stringField({
+              minLength: 1,
+              maxLength: EXECUTION_IDEMPOTENCY_KEY_MAX_LENGTH,
+            }),
+            input: optionalRecordField({ maxDepthKeys: 100 }),
+            inputRef: optionalString({ maxLength: EXECUTION_EVIDENCE_REF_MAX_LENGTH }),
+            maxAttempts: optionalInt({ min: 1, max: 25 }),
+          },
+        }),
+      execute: async (ctx) => {
+        const body = ctx.validated as {
+          taskKind: string;
+          idempotencyKey: string;
+          input: Record<string, unknown> | undefined;
+          inputRef: string | undefined;
+          maxAttempts: number | undefined;
+        };
+        return pooled.dispatchExecution({
+          executionId: ctx.params.executionId,
+          taskKind: body.taskKind,
+          input: body.input ?? {},
+          inputRef: body.inputRef === undefined ? null : body.inputRef,
+          maxAttempts: body.maxAttempts === undefined ? null : body.maxAttempts,
+          idempotencyKey: body.idempotencyKey,
+          actorId: ctx.principal.kind === 'user' ? ctx.principal.userId : null,
+          correlation: currentCorrelation(),
+        });
+      },
+      emit: async (ctx) => {
+        logger.info('executions.dispatch.recorded', undefined, {
+          execution_id: ctx.result.execution.executionId,
+          dispatch_id: ctx.result.dispatch.dispatchId,
+          task_kind: ctx.result.dispatch.taskKind,
+          replayed: ctx.result.replayed,
+          correlation_id: currentCorrelation().correlationId,
+        });
+        await recordMutationAudit(modules, ctx.principal, ctx.owner, {
+          action: 'executions.dispatch.recorded',
+          targetType: 'execution_dispatch',
+          targetId: ctx.result.dispatch.dispatchId,
+          beforeVersion: ctx.result.dispatch.version - (ctx.result.replayed ? 0 : 1),
+          afterVersion: ctx.result.dispatch.version,
+          // Keyed by the dispatch identity: a replayed duplicate converges
+          // to the same single audit row.
+          idempotencyKey: `executions.dispatch.recorded:${ctx.result.dispatch.dispatchId}`,
+          details: {
+            executionId: ctx.result.execution.executionId,
+            taskKind: ctx.result.dispatch.taskKind,
+            dispatchStatus: ctx.result.dispatch.dispatchStatus,
+            cycle: ctx.result.dispatch.cycle,
+            replayed: ctx.result.replayed,
+          },
+        });
+      },
+      respond: (ctx) =>
+        jsonResponse(ctx.result.replayed ? 200 : 201, serializeDispatchOutcome(ctx.result)),
+    }),
+  );
+
+  // -------------------------------------------------------------------------
+  // GET /api/executions/:executionId/dispatch — the dispatch record: the
+  // outbox/queue lifecycle, the current cycle and the SET-ONCE run outcome
+  // (verdict, output reference) once a worker cycle concluded. Read-only
+  // evidence of the pooled handoff.
+  // -------------------------------------------------------------------------
+  router.add(
+    'GET',
+    '/api/executions/:executionId/dispatch',
+    defineQueryRoute<{ executionId: string }, ExecutionDispatchRecord | null>({
+      authenticator: services.auth,
+      authorize: async (ctx) => {
+        await requireExecutionAccess(modules, ctx.principal, ctx.params.executionId);
+      },
+      execute: async (ctx) => pooled.getDispatch(ctx.params.executionId),
+      respond: (ctx) =>
+        jsonResponse(200, {
+          executionId: ctx.params.executionId,
+          dispatch: ctx.result === null ? null : serializeDispatch(ctx.result),
+        }),
+    }),
+  );
+}
+
+/** Serializes the pooled dispatch record (read evidence surface). */
+function serializeDispatch(dispatch: ExecutionDispatchRecord): Record<string, unknown> {
+  return {
+    dispatchId: dispatch.dispatchId,
+    executionId: dispatch.executionId,
+    taskKind: dispatch.taskKind,
+    input: dispatch.input,
+    inputRef: dispatch.inputRef,
+    queueName: dispatch.queueName,
+    handlerKind: dispatch.handlerKind,
+    maxAttempts: dispatch.maxAttempts,
+    dispatchStatus: dispatch.dispatchStatus,
+    jobId: dispatch.jobId,
+    cycle: dispatch.cycle,
+    outcome: dispatch.outcome,
+    outputRef: dispatch.outputRef,
+    output: dispatch.output,
+    outcomeReason: dispatch.outcomeReason,
+    idempotencyKey: dispatch.idempotencyKey,
+    correlationId: dispatch.correlationId,
+    causationId: dispatch.causationId,
+    createdBy: dispatch.createdBy,
+    version: dispatch.version,
+    createdAt: dispatch.createdAt,
+    updatedAt: dispatch.updatedAt,
+  };
+}
+
+function serializeDispatchOutcome(outcome: DispatchOutcome): Record<string, unknown> {
+  return {
+    dispatch: serializeDispatch(outcome.dispatch),
+    execution: serializeExecution(outcome.execution),
+    replayed: outcome.replayed,
+  };
 }

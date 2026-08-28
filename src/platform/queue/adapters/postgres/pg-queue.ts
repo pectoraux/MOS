@@ -8,6 +8,14 @@
  * idempotency key is fenced by a UNIQUE partial index (spec/implementation-
  * contract.md §8: the database, not application check-then-insert, is the
  * duplicate fence).
+ *
+ * MKT-011 stale-claim recovery: a job left 'running' by a dead worker
+ * (claimed_at older than the configured window) becomes reclaimable — a
+ * concurrent claim may re-queue it when attempts remain, or dead it when
+ * they do not. Reclaim uses the same SKIP LOCKED serialization, so at most
+ * one worker holds a job at a time; a late completion from a superseded
+ * worker fails its CAS and is surfaced as a ConflictError (the worker host
+ * logs-and-continues — it must not crash on superseded work).
  */
 
 import { ConflictError, IdempotencyConflictError } from '../../../errors/errors.ts';
@@ -48,10 +56,12 @@ interface JobRow extends DbRow {
 export class PgQueue implements JobQueue {
   private readonly db: Db;
   private readonly newAttemptId: () => string;
+  private readonly staleClaimMs: number;
 
-  constructor(db: Db, newAttemptId: () => string) {
+  constructor(db: Db, newAttemptId: () => string, staleClaimMs = 0) {
     this.db = db;
     this.newAttemptId = newAttemptId;
+    this.staleClaimMs = staleClaimMs;
   }
 
   async submit(submission: JobSubmission): Promise<SubmitResult> {
@@ -106,17 +116,33 @@ export class PgQueue implements JobQueue {
 
   async claim(workerId: string, limit: number): Promise<ReadonlyArray<JobRecord>> {
     return this.db.transaction(async (tx) => {
-      const claimed = await tx.query<JobRow>(
+      // Stale-claim recovery (MKT-011): when a reclaim window is configured,
+      // a job whose claim has outlived the window is eligible again. An
+      // exhausted stale job goes straight to 'dead' (it must not be
+      // re-queued forever); otherwise it is re-claimed (attempts +1) by this
+      // worker under the same SKIP LOCKED serialization.
+      const staleEligible =
+        this.staleClaimMs > 0
+          ? `OR (status = 'running' AND claimed_at <= now() - (${this.staleClaimMs} * interval '1 millisecond'))`
+          : '';
+      const decided = await tx.query<JobRow>(
         `UPDATE platform_jobs SET
-           status = 'running',
-           attempts = attempts + 1,
+           status = CASE
+                      WHEN status = 'running' AND attempts >= max_attempts THEN 'dead'
+                      ELSE 'running'
+                    END,
+           attempts = CASE
+                        WHEN status = 'running' AND attempts >= max_attempts THEN attempts
+                        ELSE attempts + 1
+                      END,
            claimed_by = $1,
            claimed_at = now(),
            version = version + 1,
            updated_at = now()
          WHERE job_id IN (
            SELECT job_id FROM platform_jobs
-           WHERE status = 'pending' AND run_after <= now()
+           WHERE (status = 'pending' AND run_after <= now())
+             ${staleEligible}
            ORDER BY run_after ASC, created_at ASC
            LIMIT $2
            FOR UPDATE SKIP LOCKED
@@ -125,7 +151,26 @@ export class PgQueue implements JobQueue {
         [workerId, limit],
       );
 
-      for (const row of claimed.rows) {
+      for (const row of decided.rows) {
+        if (row.status === 'dead') {
+          // An exhausted stale claim dies without another attempt row —
+          // the existing attempt history already records the crashes.
+          await tx.query(
+            `UPDATE platform_job_attempts SET finished_at = now(), outcome = 'dead',
+                     error = COALESCE(error, $3::jsonb)
+             WHERE job_id = $1 AND attempt_no = $2 AND finished_at IS NULL`,
+            [row.job_id, row.attempts, JSON.stringify({
+              code: 'STALE_CLAIM_EXPIRED',
+              message: `claim expired; job reclaimed with attempts exhausted (attempts ${row.attempts} of ${row.max_attempts})`,
+              retryable: false,
+              retrySafe: false,
+              attempt: row.attempts,
+              workerId,
+              at: new Date().toISOString(),
+            })],
+          );
+          continue;
+        }
         await tx.query(
           `INSERT INTO platform_job_attempts
              (attempt_id, job_id, attempt_no, worker_id, correlation_id, started_at, outcome)
@@ -134,7 +179,9 @@ export class PgQueue implements JobQueue {
         );
       }
 
-      return claimed.rows.map(toJobRecord);
+      // Only re-claimed (running) rows are handed to the worker; rows this
+      // pass sent to 'dead' are not executable.
+      return decided.rows.filter((row) => row.status === 'running').map(toJobRecord);
     });
   }
 
@@ -226,7 +273,20 @@ export class PgQueue implements JobQueue {
     const result = await this.db.query<{ exists: boolean }>(
       `SELECT EXISTS (SELECT 1 FROM platform_jobs WHERE status = 'pending') AS exists`,
     );
-    return result.rows[0]?.exists === true;
+    if (result.rows[0]?.exists === true) return true;
+    if (this.staleClaimMs > 0) {
+      // With a reclaim window configured, a stale 'running' job is pending
+      // work (drain-mode workers must wait for its reclaim, not exit early).
+      const stale = await this.db.query<{ exists: boolean }>(
+        `SELECT EXISTS (
+           SELECT 1 FROM platform_jobs
+           WHERE status = 'running'
+             AND claimed_at <= now() - (${this.staleClaimMs} * interval '1 millisecond')
+         ) AS exists`,
+      );
+      return stale.rows[0]?.exists === true;
+    }
+    return false;
   }
 }
 

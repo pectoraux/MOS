@@ -187,6 +187,23 @@ export class SandboxLeasesStore {
     );
     return result.rows.map(toSandboxLeaseRecord);
   }
+
+  /**
+   * ACTIVE leases whose expiry metadata has passed — the stale/reclaimable
+   * set ("A stale lease can be reclaimed through a durable recovery
+   * operation"; the MKT-010-documented recovery automation, driven by the
+   * MKT-011 pooled runtime). Read-only evidence for the runtime sweep;
+   * reclamation itself goes through releaseExecutionSandboxLease.
+   */
+  async listReclaimableSandboxLeases(beforeIso: string): Promise<readonly SandboxLeaseRecord[]> {
+    const result = await this.db.query<SandboxLeaseRow>(
+      `${SANDBOX_LEASE_SELECT}
+       WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at < $1
+       ORDER BY expires_at, sandbox_lease_id`,
+      [beforeIso],
+    );
+    return result.rows.map(toSandboxLeaseRecord);
+  }
 }
 
 /**
