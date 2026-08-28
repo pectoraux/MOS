@@ -105,6 +105,7 @@
 import type { Clock } from '../../platform/clock/clock.ts';
 import type { Db } from '../../platform/db/contract.ts';
 import type { IdGenerator } from '../../platform/ids/ids.ts';
+import type { SandboxDriver } from '../../platform/sandboxes/driver.ts';
 import type { WorkspaceRecord, WorkspacesModuleApi, WorkspaceOwnerContext } from '../workspaces/public.ts';
 
 /**
@@ -160,6 +161,128 @@ export const SANDBOX_RUNTIME_CLASSES: readonly RuntimeClass[] = [
   'persistent-sandbox',
   'dedicated-runtime',
 ];
+
+/**
+ * The sandbox KIND (tenant-runtime-v1.2.md "Sandbox classes"): the 1:1
+ * environment-class mapping of the frozen sandbox runtime classes.
+ *
+ *   - `ephemeral`: created for a bounded Execution and released afterward —
+ *     execution-scoped through the LEASE, never through identity;
+ *   - `persistent`: owned by a Client/Workspace runtime scope — may survive
+ *     individual Executions and be leased by later authorized Executions in
+ *     that Workspace ("Reuse never reuses Execution identity or
+ *     workflow/task identity");
+ *   - `dedicated`: a separately isolated runtime environment associated
+ *     with a Client/Workload policy — may host multiple authorized
+ *     Executions while retaining separate Execution identities.
+ */
+export type SandboxKind = 'ephemeral' | 'persistent' | 'dedicated';
+
+/** The sandbox classes whose environments are REUSABLE across executions. */
+export const REUSABLE_SANDBOX_KINDS: readonly SandboxKind[] = ['persistent', 'dedicated'];
+
+/** Runtime-class → environment-class mapping (pure, frozen). */
+export function sandboxKindForRuntimeClass(
+  runtimeClass: RuntimeClass,
+): SandboxKind | null {
+  switch (runtimeClass) {
+    case 'ephemeral-sandbox':
+      return 'ephemeral';
+    case 'persistent-sandbox':
+      return 'persistent';
+    case 'dedicated-runtime':
+      return 'dedicated';
+    default:
+      return null;
+  }
+}
+
+/**
+ * The DECLARED RUNTIME CONTRACT of a sandbox — the selected concurrency
+ * invariant (tenant-runtime-v1.2.md: "Only one active lease may control a
+ * Sandbox at a time unless the Sandbox contract explicitly declares safe
+ * concurrency. The database must enforce the selected concurrency
+ * invariant"): `exclusive` (the default strict invariant — exactly one
+ * permitted controller at a time) or `concurrent-safe` (the contract that
+ * explicitly permits safe concurrent use — the dedicated-runtime shape).
+ * Immutable after provisioning; recorded on every lease at acquisition.
+ */
+export type SandboxConcurrencyContract = 'exclusive' | 'concurrent-safe';
+
+export const SANDBOX_CONCURRENCY_CONTRACTS: readonly SandboxConcurrencyContract[] = [
+  'exclusive',
+  'concurrent-safe',
+];
+
+/**
+ * The FROZEN sandbox lifecycle — state-machines.md "Sandbox", reaffirmed by
+ * state-machines-v1.2.md:
+ *
+ *   REQUESTED → PREPARING → READY
+ *                    ├→ FAILED
+ *                    └→ CANCELLED
+ *   READY → RELEASING → RELEASED
+ *   READY → CANCELLED → RELEASED
+ *
+ * A sandbox is born REQUESTED (identity allocated, provisioning not yet
+ * started). PREPARING is the driver provisioning phase; it settles READY
+ * (with the driver-reported resource descriptor — the runtime resource
+ * state) or FAILED (with the recorded provisioning failure). CANCELLED is
+ * NOT terminal: its only forward edge is RELEASED (teardown still runs).
+ * FAILED and RELEASED are terminal and immutable. Note the frozen shape:
+ * REQUESTED's only forward edge is PREPARING — a requested sandbox cannot be
+ * cancelled directly.
+ *
+ * "Sandbox state is independent of any one Execution. Execution obtains and
+ * releases a durable Sandbox lease" (state-machines-v1.2.md); a sandbox may
+ * never transition an Execution directly.
+ */
+export type SandboxStatus =
+  | 'requested'
+  | 'preparing'
+  | 'ready'
+  | 'failed'
+  | 'cancelled'
+  | 'releasing'
+  | 'released';
+
+export const SANDBOX_STATUSES: readonly SandboxStatus[] = [
+  'requested',
+  'preparing',
+  'ready',
+  'failed',
+  'cancelled',
+  'releasing',
+  'released',
+];
+
+/** The terminal sandbox states — frozen rows that reject every change. */
+export const SANDBOX_TERMINAL_STATUSES: readonly SandboxStatus[] = ['failed', 'released'];
+
+/**
+ * The FROZEN sandbox transition table (exhaustive; unit-tested edge for edge
+ * against the spec diagrams — eight legal edges, no self-loops, no
+ * skip-edges, no edges out of the terminal states).
+ */
+export const SANDBOX_TRANSITIONS: Readonly<Record<SandboxStatus, readonly SandboxStatus[]>> = {
+  requested: ['preparing'],
+  preparing: ['ready', 'failed', 'cancelled'],
+  ready: ['releasing', 'cancelled'],
+  releasing: ['released'],
+  cancelled: ['released'],
+  failed: [],
+  released: [],
+};
+
+/** Transition-guard predicate: true exactly when (from → to) is a frozen edge. */
+export function isLegalSandboxTransition(from: SandboxStatus, to: SandboxStatus): boolean {
+  return SANDBOX_TRANSITIONS[from].includes(to);
+}
+
+/** Terminal-state predicate: failed/released and nothing else. */
+export function isTerminalSandboxStatus(status: SandboxStatus): boolean {
+  return SANDBOX_TERMINAL_STATUSES.includes(status);
+}
 
 /**
  * The §24 retry-safety classification every failure must declare: "Retryable
@@ -381,18 +504,24 @@ export interface ExecutionCreateOutcome {
  * Execution→Sandbox relationship (implementation-contract-v1.2.md §1 /
  * tenant-runtime-v1.2.md). The lease identity tuple (sandbox_lease_id +
  * sandbox_id + execution_id + client_id + workspace_id) is immutable; the
- * lease carries state/version and expiry/recovery metadata; `sandboxId` is
- * an opaque reference (the sandbox lifecycle authority is MKT-012 — there
- * is no sandbox entity here, and execution_id is never Sandbox identity).
+ * lease carries state/version and expiry/recovery metadata. Since MKT-012
+ * the lease also records the sandbox's DECLARED CONCURRENCY CONTRACT at
+ * acquisition (server-derived from the sandbox row, immutable after
+ * acquisition) — the enforcement metadata behind the contract-selected
+ * one-active-controller backstop. `sandboxId` references the sandbox
+ * entity provisioned through this same module (execution_id is never
+ * Sandbox identity).
  */
 export interface SandboxLeaseRecord {
   readonly sandboxLeaseId: string;
-  /** Opaque sandbox reference — resolved by the runtime/sandbox authority (MKT-012). */
+  /** The provisioned sandbox this lease controls (validated: READY, same scope, same class). */
   readonly sandboxId: string;
   readonly executionId: string;
   readonly workspaceId: string;
   readonly clientId: string;
   readonly status: 'active' | 'released';
+  /** The sandbox's declared concurrency contract, recorded at acquisition. */
+  readonly concurrencyContract: SandboxConcurrencyContract;
   readonly acquiredBy: string | null;
   readonly releasedAt: string | null;
   /** Expiry/recovery metadata — when set and passed, the active lease is stale and reclaimable. */
@@ -425,6 +554,141 @@ export interface LeaseReleaseOutcome {
   readonly lease: SandboxLeaseRecord;
   readonly execution: ExecutionRecord;
   readonly replayed: boolean;
+}
+
+/**
+ * Immutable storage shape of one persisted SANDBOX — the runtime ENVIRONMENT
+ * identity (MKT-012; tenant-runtime-v1.2.md). The identity tuple
+ * (sandbox_id + client_id + workspace_id + runtime_class +
+ * environment_identity) is immutable and contains NO execution ownership —
+ * `execution_id` is NOT part of Sandbox identity (the Execution→Sandbox
+ * relationship is the LEASE, a separate record). The declared contract
+ * (capabilities, concurrency contract) and provisioning provenance are
+ * immutable; `status` moves along the frozen sandbox machine;
+ * `resourceDescriptor` is set once at ready (the driver-reported runtime
+ * resource state), `prepareError` set once at failed, `releasedAt` set once
+ * at released. NO credential material anywhere on this record (RUNTIME-AC-03).
+ */
+export interface SandboxRecord {
+  readonly sandboxId: string;
+  readonly workspaceId: string;
+  readonly clientId: string;
+  readonly runtimeClass: RuntimeClass;
+  readonly environmentIdentity: string;
+  /** Declared required capabilities (bounded strings; never credentials). */
+  readonly capabilities: readonly string[];
+  readonly concurrencyContract: SandboxConcurrencyContract;
+  readonly status: SandboxStatus;
+  /** Set once at ready — the opaque driver-reported environment handle. */
+  readonly resourceDescriptor: string | null;
+  /** Set once at failed — the recorded provisioning failure. */
+  readonly prepareError: string | null;
+  /** Set once at released — the teardown completion timestamp. */
+  readonly releasedAt: string | null;
+  readonly idempotencyKey: string;
+  /** The §8 digest of the fenced logical provisioning command (convergence proof). */
+  readonly provisionFingerprint: string;
+  readonly version: number;
+  readonly createdBy: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+/**
+ * One APPLIED sandbox transition — append-only history (the table rejects
+ * UPDATE and DELETE at the database level, and rejects history rows whose
+ * from_status does not match the sandbox's durable status). `reason` is
+ * REQUIRED on transitions into failed (the provisioning failure) and
+ * optional evidence elsewhere.
+ */
+export interface SandboxTransitionRecord {
+  readonly transitionId: string;
+  readonly sandboxId: string;
+  readonly idempotencyKey: string;
+  readonly fromStatus: SandboxStatus;
+  readonly toStatus: SandboxStatus;
+  readonly reason: string | null;
+  readonly createdBy: string | null;
+  readonly createdAt: string;
+}
+
+/**
+ * The outcome of a sandbox PROVISION command: the sandbox record and whether
+ * this request was a REPLAY — either a duplicate §8 command key, or the
+ * REUSE convergence of a second provisioning request for the same LIVE
+ * reusable environment (same workspace + runtime class + environment
+ * identity) to the one existing sandbox ("the same persistent sandbox may
+ * be reused"; "A crash must not create a second Sandbox"). No second
+ * sandbox row is ever created by either convergence path.
+ */
+export interface SandboxProvisionOutcome {
+  readonly sandbox: SandboxRecord;
+  readonly replayed: boolean;
+}
+
+/**
+ * The outcome of one sandbox lifecycle protocol command (prepare / cancel /
+ * release): the sandbox record AFTER the protocol settled, the LAST recorded
+ * transition the protocol applied or converged to, and whether this request
+ * was a REPLAY (converged to already-recorded state — no new edges). The
+ * protocol ops are STATE-DRIVEN convergence commands: the outcome is a
+ * function of the durable sandbox state, every edge application is a
+ * recorded idempotency-fenced transition, and the driver is invoked outside
+ * the row-lock transactions.
+ */
+export interface SandboxLifecycleOutcome {
+  readonly sandbox: SandboxRecord;
+  readonly transition: SandboxTransitionRecord;
+  readonly replayed: boolean;
+}
+
+/**
+ * The CANONICAL SANDBOX OWNER CONTEXT: the sandbox row → its owning
+ * Workspace → the owning Client → the owning Agency, all derived from
+ * durable state on every call. Sandbox-scoped operations authorize against
+ * this context — never against caller-supplied tenant or sandbox identity.
+ * `scope` mirrors the pipeline OwnerScope sandbox variant.
+ */
+export interface SandboxOwnerContext {
+  readonly scope: {
+    readonly kind: 'sandbox';
+    readonly agencyId: string;
+    readonly clientId: string;
+    readonly workspaceId: string;
+    readonly sandboxId: string;
+  };
+  readonly sandbox: SandboxRecord;
+  readonly workspace: WorkspaceRecord;
+  readonly client: ExecutionClientRow;
+  readonly agency: ExecutionAgencySummary;
+  readonly resolvedAt: string;
+}
+
+/**
+ * Pure composition of the canonical sandbox owner context from
+ * ALREADY-RESOLVED durable rows. Purity is asserted by unit tests.
+ */
+export function composeSandboxOwnerContext(
+  sandbox: SandboxRecord,
+  workspace: WorkspaceRecord,
+  client: ExecutionClientRow,
+  agency: ExecutionAgencySummary,
+  resolvedAt: string,
+): SandboxOwnerContext {
+  return {
+    scope: {
+      kind: 'sandbox',
+      agencyId: agency.agencyId,
+      clientId: sandbox.clientId,
+      workspaceId: sandbox.workspaceId,
+      sandboxId: sandbox.sandboxId,
+    },
+    sandbox,
+    workspace,
+    client,
+    agency,
+    resolvedAt,
+  };
 }
 
 /**
@@ -590,17 +854,26 @@ export interface ExecutionsModuleApi {
   /**
    * Acquires the SANDBOX LEASE — the durable Execution→Sandbox
    * relationship (implementation-contract-v1.2.md §1). Concurrency-safe
-   * and idempotent: the database allows AT MOST ONE ACTIVE LEASE PER
-   * SANDBOX (the strict v1.2 concurrency invariant — exactly one
-   * permitted controller; a sandbox contract declaring safe concurrency
-   * arrives with the MKT-012 sandbox authority) and at most one active
-   * lease per execution; a duplicate of the same logical acquisition
-   * command converges to the existing ACTIVE lease (replayed=true).
-   * Guards: the execution must be NON-TERMINAL and its runtime class a
-   * SANDBOX class (a pooled-worker execution holds no sandbox). The lease
-   * scope is server-derived from the execution. Optional `expiresAt`
-   * records the expiry/recovery metadata (when set and passed, the active
-   * lease is stale and reclaimable through releaseExecutionSandboxLease).
+   * and idempotent: the database enforces the sandbox's DECLARED
+   * concurrency contract — at most ONE ACTIVE LEASE per `exclusive`
+   * sandbox (the strict v1.2 invariant — exactly one permitted
+   * controller), while a `concurrent-safe` sandbox may be concurrently
+   * controlled by multiple active leases — and at most one active lease
+   * per execution under every contract. A duplicate of the same logical
+   * acquisition command converges to the existing ACTIVE lease
+   * (replayed=true).
+   *
+   * Guards (module-side, with the migration-013 DB trigger as backstop):
+   * the execution must be NON-TERMINAL with a SANDBOX runtime class (a
+   * pooled-worker execution holds no sandbox), and `sandboxId` must
+   * reference a provisioned sandbox that is READY, in the SAME client and
+   * workspace as the execution (cross-scope leasing is forbidden), and of
+   * the SAME runtime class as the execution's declared class. The lease
+   * records the sandbox's declared concurrency contract (server-derived,
+   * immutable after acquisition). The lease scope is server-derived from
+   * the execution. Optional `expiresAt` records the expiry/recovery
+   * metadata (when set and passed, the active lease is stale and
+   * reclaimable through releaseExecutionSandboxLease).
    */
   acquireExecutionSandboxLease(input: {
     readonly executionId: string;
@@ -642,6 +915,111 @@ export interface ExecutionsModuleApi {
    * runtime policy (MKT-011); the module records the metadata.
    */
   listReclaimableSandboxLeases(beforeIso: string): Promise<readonly SandboxLeaseRecord[]>;
+  /**
+   * PROVISIONS a sandbox — records the runtime ENVIRONMENT identity, born
+   * REQUESTED (MKT-012; tenant-runtime-v1.2.md). The sandbox identity tuple
+   * is server-derived from the canonical Workspace owner (client/workspace
+   * scope); `execution_id` is never part of it.
+   *
+   *   - `runtimeClass`: one of the three SANDBOX classes (a pooled-worker
+   *     sandbox is a contract error — pooled executions hold no sandbox);
+   *   - `environmentIdentity`: REQUIRED for the reusable classes
+   *     (persistent/dedicated — the caller-named environment key), MUST be
+   *     omitted for the ephemeral class (the server generates a unique
+   *     nonce: an ephemeral environment is never reused);
+   *   - `capabilities`: declared required capabilities (bounded strings —
+   *     the Work-Order "required capabilities" field; never credentials);
+   *   - `concurrencyContract`: the DECLARED RUNTIME CONTRACT — 'exclusive'
+   *     (default; exactly one active controller) or 'concurrent-safe'
+   *     (explicitly permits safe concurrent use);
+   *   - `idempotencyKey`: the §8 logical command key, UNIQUE per workspace.
+   *
+   * Convergence (both paths return the ONE existing sandbox,
+   * replayed=true): (1) a duplicate §8 key of the same command (fingerprint
+   * proof; a key reused for a different command is a ConflictError); (2)
+   * the REUSE fence — provisioning a REUSABLE class whose LIVE environment
+   * (same workspace + class + environment identity) already exists
+   * converges to it ("the same persistent sandbox may be reused";
+   * "A crash must not create a second Sandbox" — the DB partial UNIQUE
+   * fence is the backstop). A FAILED or RELEASED environment may be
+   * re-provisioned under the same identity as a NEW sandbox row.
+   *
+   * Boundary policy: provisioning is NEW USE — requires ACTIVE Workspace,
+   * Client and Agency boundaries.
+   */
+  provisionSandbox(input: {
+    readonly workspaceId: string;
+    readonly runtimeClass: RuntimeClass;
+    readonly environmentIdentity: string | null;
+    readonly capabilities: readonly string[];
+    readonly concurrencyContract: SandboxConcurrencyContract;
+    readonly idempotencyKey: string;
+    readonly actorId: string | null;
+  }): Promise<SandboxProvisionOutcome>;
+  /**
+   * The PREPARE protocol — drives REQUESTED → PREPARING, invokes the
+   * sandbox driver (outside the row-lock transactions), and settles
+   * PREPARING → READY (with the driver-reported resource descriptor) or
+   * PREPARING → FAILED (with the recorded provisioning failure; terminal).
+   * State-driven convergence, idempotent by recorded transition keys
+   * derived from the caller's §8 command key: re-invoking after a crash
+   * between the recorded edges re-attempts the driver on the SAME sandbox
+   * and settles; a prepare of an already-READY sandbox converges
+   * (replayed=true) without re-running anything; FAILED/RELEASED reject
+   * (terminal); REQUESTED's only forward edge is PREPARING, so there is no
+   * prepare-less cancel (the frozen machine).
+   */
+  prepareSandbox(input: {
+    readonly sandboxId: string;
+    readonly idempotencyKey: string;
+    readonly actorId: string | null;
+  }): Promise<SandboxLifecycleOutcome>;
+  /**
+   * The CANCEL protocol — applies the frozen cancel edge (PREPARING →
+   * CANCELLED or READY → CANCELLED; REQUESTED cannot be cancelled — its
+   * only forward edge is PREPARING), then completes the teardown
+   * (CANCELLED → RELEASED through the driver, best-effort: a teardown
+   * failure leaves the sandbox CANCELLED and a later releaseSandbox retries
+   * — "Release is idempotent and recoverable"). Idempotent: cancelling an
+   * already-CANCELLED sandbox completes the teardown; a cancelled sandbox
+   * never returns to ready (terminal teardown is one-way).
+   */
+  cancelSandbox(input: {
+    readonly sandboxId: string;
+    readonly idempotencyKey: string;
+    readonly actorId: string | null;
+  }): Promise<SandboxLifecycleOutcome>;
+  /**
+   * The RELEASE protocol — the graceful teardown: READY → RELEASING →
+   * driver teardown → RELEASED; also completes CANCELLED → RELEASED and
+   * re-drives a crash-window RELEASING sandbox to RELEASED. IDEMPOTENT and
+   * RECOVERABLE (state-driven; re-invocation converges, replayed=true on
+   * the already-released sandbox). GATED: a sandbox cannot be released (or
+   * cancelled) while an ACTIVE lease controls it — release the lease first
+   * (owner release or the deterministic stale-lease reclamation); the DB
+   * release-gate trigger is the backstop. Releasing a sandbox NEVER
+   * terminalizes or transitions any Execution.
+   */
+  releaseSandbox(input: {
+    readonly sandboxId: string;
+    readonly idempotencyKey: string;
+    readonly actorId: string | null;
+  }): Promise<SandboxLifecycleOutcome>;
+  /** Raw sandbox record by id — route internal reads. */
+  getSandbox(sandboxId: string): Promise<SandboxRecord | null>;
+  /**
+   * Canonical sandbox ownership resolution: the sandbox row → its owning
+   * Workspace → the owning Client → the owning Agency. Null when the
+   * sandbox does not exist OR its Workspace/Client is a deleted tombstone
+   * (uniform 404 upstream — the hard-boundary posture).
+   */
+  resolveSandboxOwnership(sandboxId: string): Promise<SandboxOwnerContext | null>;
+  /** The sandboxes of one Workspace in EVERY lifecycle state, oldest first. */
+  listSandboxesForWorkspace(workspaceId: string): Promise<readonly SandboxRecord[]>;
+  /** The append-only applied-transition history of one sandbox, oldest first. */
+  getSandboxTransitions(sandboxId: string): Promise<readonly SandboxTransitionRecord[]>;
+  /** The leases ever held on one sandbox, oldest first (read-only evidence). */
+  listSandboxLeases(sandboxId: string): Promise<readonly SandboxLeaseRecord[]>;
 }
 
 export interface ExecutionsModuleDeps {
@@ -650,6 +1028,13 @@ export interface ExecutionsModuleDeps {
   readonly ids: IdGenerator;
   /** Dependency matrix (MKT-010 subset): /executions ──→ /workspaces. */
   readonly workspaces: WorkspacesModuleApi;
+  /**
+   * The sandbox environment driver (MKT-012): provider-neutral platform
+   * port, wired at the composition root. The driver is NEVER an authority
+   * — the module interprets its outcomes and records them through its own
+   * ports.
+   */
+  readonly sandboxDriver: SandboxDriver;
 }
 
 export { createExecutionsModule } from './internal/executions-module.ts';

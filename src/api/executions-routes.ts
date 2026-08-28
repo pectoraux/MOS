@@ -385,6 +385,7 @@ function serializeSandboxLease(lease: SandboxLeaseRecord): Record<string, unknow
     workspaceId: lease.workspaceId,
     clientId: lease.clientId,
     status: lease.status,
+    concurrencyContract: lease.concurrencyContract,
     ...(lease.acquiredBy === null ? {} : { acquiredBy: lease.acquiredBy }),
     ...(lease.releasedAt === null ? {} : { releasedAt: lease.releasedAt }),
     ...(lease.expiresAt === null ? {} : { expiresAt: lease.expiresAt }),

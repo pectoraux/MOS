@@ -1184,12 +1184,26 @@ test('recovery: an expired ACTIVE sandbox lease is released by the sweep; the ex
   assert.equal(create.status, 201);
   const executionId = (create.body['execution'] as Record<string, unknown>)['executionId'] as string;
 
+  // A real READY ephemeral sandbox of this execution's class and scope
+  // (MKT-012: a lease references a provisioned sandbox).
+  const provision = await apiCall(port(), `/api/workspaces/${tenant.workspaceId}/sandboxes`, {
+    token: tenant.owner.token,
+    body: { runtimeClass: 'ephemeral-sandbox', idempotencyKey: 'sbx-expired-1' },
+  });
+  assert.equal(provision.status, 201, JSON.stringify(provision.body));
+  const sandboxId = (provision.body['sandbox'] as Record<string, unknown>)['sandboxId'] as string;
+  const prepared = await apiCall(port(), `/api/sandboxes/${sandboxId}/prepare`, {
+    token: tenant.owner.token,
+    body: { idempotencyKey: `prepare:${sandboxId}` },
+  });
+  assert.equal(prepared.status, 200, JSON.stringify(prepared.body));
+
   // An already-expired lease (MKT-010 permits recording past expiry —
   // immediately stale, reclaimable).
   const lease = await apiCall(port(), `/api/executions/${executionId}/sandbox-leases`, {
     token: tenant.owner.token,
     body: {
-      sandboxId: 'sbx-expired-1',
+      sandboxId,
       idempotencyKey: 'lease-1',
       expiresAt: '2020-01-01T00:00:00.000Z',
     },
