@@ -67,6 +67,18 @@ export function optionalString(options: {
   };
 }
 
+export function optionalRecordField(
+  options: { maxDepthKeys?: number } = {},
+): FieldSpec<Record<string, unknown> | undefined> {
+  return {
+    required: false,
+    parse: (value, problems) => {
+      if (value === undefined) return undefined;
+      return recordField(options).parse(value, problems);
+    },
+  };
+}
+
 export function recordField(options: { maxDepthKeys?: number } = {}): FieldSpec<Record<string, unknown>> {
   return {
     required: true,

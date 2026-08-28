@@ -16,6 +16,7 @@
 import type { AppConfig } from './config/config.ts';
 import type { Clock } from './clock/clock.ts';
 import type { Db } from './db/contract.ts';
+import type { HttpCallPort } from './http/outbound.ts';
 import type { RequestAuthenticator } from './http/auth/contract.ts';
 import type { IdGenerator } from './ids/ids.ts';
 import type { JobQueue } from './queue/contract.ts';
@@ -38,6 +39,8 @@ export interface AppServices {
   readonly locks: LockPort;
   /** Resolution-only secret backend (MKT-005, CRED-001) — used by /credentials. */
   readonly secrets: SecretStore;
+  /** Bounded provider-neutral outbound HTTP (MKT-011 pooled api.request runner). */
+  readonly httpCalls: HttpCallPort;
   readonly auth: RequestAuthenticator;
   readonly observability: {
     readonly sink: ObservabilitySink;

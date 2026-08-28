@@ -633,6 +633,15 @@ export interface ExecutionsModuleApi {
    * runtime resource relationship.
    */
   listExecutionSandboxLeases(executionId: string): Promise<readonly SandboxLeaseRecord[]>;
+  /**
+   * ACTIVE leases whose expiry metadata has passed (`expires_at < now`) —
+   * the stale/reclaimable set, oldest expiry first. Read-only evidence for
+   * the runtime recovery sweep: reclamation itself goes through
+   * releaseExecutionSandboxLease (idempotent, never terminalizing), never
+   * through direct writes. Interpreting expiry against the clock is
+   * runtime policy (MKT-011); the module records the metadata.
+   */
+  listReclaimableSandboxLeases(beforeIso: string): Promise<readonly SandboxLeaseRecord[]>;
 }
 
 export interface ExecutionsModuleDeps {

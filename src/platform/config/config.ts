@@ -87,6 +87,13 @@ export interface AppConfig {
   readonly jobMaxAttempts: number;
   /** Base delay for exponential retry backoff. */
   readonly jobRetryBackoffBaseMs: number;
+  /**
+   * Stale-claim recovery window (MKT-011): a job left 'running' by a dead
+   * worker (claimed_at older than this many milliseconds) becomes
+   * reclaimable — re-queued when attempts remain, dead otherwise. 0
+   * disables reclaim (MKT-001 behavior).
+   */
+  readonly queueStaleClaimMs: number;
 }
 
 type Env = Record<string, string | undefined>;
@@ -140,6 +147,7 @@ export function loadConfig(env: Env = process.env): AppConfig {
   const workerBatchSize = readInt(env, 'MOS_WORKER_BATCH_SIZE', 5, 1, 100, problems);
   const jobMaxAttempts = readInt(env, 'MOS_JOB_MAX_ATTEMPTS', 5, 1, 100, problems);
   const jobRetryBackoffBaseMs = readInt(env, 'MOS_JOB_RETRY_BACKOFF_BASE_MS', 1_000, 1, 3_600_000, problems);
+  const queueStaleClaimMs = readInt(env, 'MOS_QUEUE_STALE_CLAIM_MS', 300_000, 0, 86_400_000, problems);
 
   if (problems.length > 0) {
     throw new ConfigError('Invalid platform configuration', problems);
@@ -167,6 +175,7 @@ export function loadConfig(env: Env = process.env): AppConfig {
     workerBatchSize,
     jobMaxAttempts,
     jobRetryBackoffBaseMs,
+    queueStaleClaimMs,
   };
 }
 
