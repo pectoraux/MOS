@@ -36,7 +36,14 @@
  *     rewrites and identity/definition/scope reassignment under direct
  *     SQL; the transition history is append-only (UPDATE and DELETE are
  *     rejected); an instance can never be inserted pinning a non-ACTIVE
- *     or foreign definition;
+ *     or foreign definition — and the MKT-009 history-ledger erratum
+ *     backstop (spec/errata/MKT-009-history-ledger.md, migration 014): a
+ *     direct-SQL history row whose from_status does not equal the
+ *     instance's durable current status is REJECTED as fabricated (a
+ *     history row for an unknown instance too), while a CONSISTENT row
+ *     records fine and the normal application transition path still
+ *     succeeds (the same integrity guarantee as the execution and sandbox
+ *     ledgers);
  *   - cross-tenant posture: a foreign-agency member sees the same 404s as
  *     for unknown identifiers on every instance route (no
  *     traversal/existence oracle); an instance id of a DIFFERENT workflow
@@ -826,6 +833,117 @@ test('database backstops: the frozen §5 machine, the pin, the scope and the app
   } finally {
     await db.close();
   }
+});
+
+test('database backstop: the MKT-009 history-ledger erratum — fabricated applied transitions are rejected, consistent history records, the authorized path is untouched (migration 014)', async () => {
+  const workflowId = await makeWorkflow('Erratum Backstop Workflow');
+  const { definitionId } = await makeActiveDefinition(workflowId);
+
+  // Proof 1: advance an instance to a non-initial state — all the way to
+  // the SUCCEEDED terminal state (the fabricated rows below claim edges
+  // from EARLIER lifecycle points).
+  const succeededId = await makeInstance(workflowId, definitionId);
+  await transition(workflowId, succeededId, 'ready', 1, 'erratum-stage', owner.token);
+  await transition(workflowId, succeededId, 'running', 2, 'erratum-start', owner.token);
+  await transition(workflowId, succeededId, 'succeeded', 3, 'erratum-succeed', owner.token);
+
+  // A second instance held at RUNNING (non-terminal) for the
+  // consistent-row probe.
+  const runningId = await makeInstance(workflowId, definitionId);
+  await transition(workflowId, runningId, 'ready', 1, 'erratum-running-stage', owner.token);
+  await transition(workflowId, runningId, 'running', 2, 'erratum-running-start', owner.token);
+
+  const db = new PgDb(stack!.env.databaseUrl, 2);
+  try {
+    // Proof 2 + 3 (the DEFECT PROBE — the exact erratum example): a
+    // direct SQL insert of a legal-pair transition whose from_status does
+    // NOT match the instance's actual status is REJECTED. On the pre-fix
+    // schema (migration 010 alone) this insert SUCCEEDED — the history
+    // trigger checked only the legal pair.
+    await assert.rejects(
+      db.query(
+        `INSERT INTO workflow_instance_transitions (transition_id, workflow_instance_id, idempotency_key,
+                                                    from_status, to_status, reason, created_at)
+         VALUES (gen_random_uuid(), $1, 'erratum-fabricated-early', 'draft', 'ready', '', now())`,
+        [succeededId],
+      ),
+      /fabricated applied transition rejected: workflow instance .* is durably succeeded but the history row claims from_status draft/,
+    );
+    // A fabricated row from a LATER lifecycle point is rejected too (the
+    // instance is durably succeeded, not running).
+    await assert.rejects(
+      db.query(
+        `INSERT INTO workflow_instance_transitions (transition_id, workflow_instance_id, idempotency_key,
+                                                    from_status, to_status, reason, created_at)
+         VALUES (gen_random_uuid(), $1, 'erratum-fabricated-mid', 'running', 'paused', '', now())`,
+        [succeededId],
+      ),
+      /fabricated applied transition rejected/,
+    );
+    // A history row for an UNKNOWN instance is rejected.
+    await assert.rejects(
+      db.query(
+        `INSERT INTO workflow_instance_transitions (transition_id, workflow_instance_id, idempotency_key,
+                                                    from_status, to_status, reason, created_at)
+         VALUES (gen_random_uuid(), $1, 'erratum-unknown', 'draft', 'ready', '', now())`,
+        ['00000000-0000-4000-8000-000000000f01'],
+      ),
+      /cannot record a transition for unknown workflow instance/,
+    );
+
+    // The predicate is CONSISTENCY, not a writer ban: a direct-SQL row
+    // whose from_status MATCHES the durable status records fine (the same
+    // record-only residual the execution and sandbox ledgers document).
+    const consistent = await db.query(
+      `INSERT INTO workflow_instance_transitions (transition_id, workflow_instance_id, idempotency_key,
+                                                    from_status, to_status, reason, created_at)
+       VALUES (gen_random_uuid(), $1, 'erratum-consistent', 'running', 'paused', 'record-only probe', now())`,
+      [runningId],
+    );
+    assert.equal(consistent.rowCount, 1, 'a consistent history row records (consistency, not a writer ban)');
+  } finally {
+    await db.close();
+  }
+
+  // Proof 4: the normal application transition path still succeeds under
+  // the backstop — a THIRD instance driven through the full §5 chain via
+  // the API (the authorized writer holds the instance row lock, so the
+  // trigger's FOR UPDATE resolution re-enters under it), with every
+  // recorded history row consistent (each from_status equals the previous
+  // to_status; the first from_status equals the born-draft state).
+  const thirdId = await makeInstance(workflowId, definitionId);
+  const chain: Array<[string, number, string]> = [
+    ['ready', 1, 'erratum-chain-stage'],
+    ['running', 2, 'erratum-chain-start'],
+    ['paused', 3, 'erratum-chain-pause'],
+    ['running', 4, 'erratum-chain-resume'],
+    ['succeeded', 5, 'erratum-chain-succeed'],
+  ];
+  for (const [to, version, key] of chain) {
+    const applied = await transition(workflowId, thirdId, to, version, key, owner.token);
+    assert.equal(applied.status, 200, JSON.stringify(applied.body));
+    assert.equal((applied.body['instance'] as Record<string, unknown>)['status'], to);
+    assert.equal(applied.body['replayed'], false);
+  }
+  // The recorded history is the exact applied chain — five rows, each
+  // consistent with the durable state at its application.
+  const history = await apiCall(port(), `/api/workflows/${workflowId}/instances/${thirdId}/transitions`, {
+    token: owner.token,
+  });
+  assert.equal(history.status, 200, JSON.stringify(history.body));
+  const rows = (history.body as Record<string, unknown>)['transitions'] as Array<Record<string, unknown>>;
+  assert.equal(rows.length, 5);
+  const expectedFrom = ['draft', 'ready', 'running', 'paused', 'running'];
+  const expectedTo = ['ready', 'running', 'paused', 'running', 'succeeded'];
+  for (let i = 0; i < rows.length; i += 1) {
+    assert.equal(rows[i]!['fromStatus'], expectedFrom[i], `history row ${i} from_status`);
+    assert.equal(rows[i]!['toStatus'], expectedTo[i], `history row ${i} to_status`);
+  }
+  // And the idempotent replay still converges under the backstop (the
+  // replay path never inserts — it converges to the recorded row).
+  const replay = await transition(workflowId, thirdId, 'succeeded', 5, 'erratum-chain-succeed', owner.token);
+  assert.equal(replay.status, 200, JSON.stringify(replay.body));
+  assert.equal(replay.body['replayed'], true);
 });
 
 test('every instance mutation lands in the append-only audit trail with workflow scope and correlation', async () => {

@@ -420,6 +420,10 @@ test('MKT-005: migrations 005/006 exist with exactly the expected numbering (no 
     '012_execution_dispatches.sql',
     // MKT-012 appends the sandbox runtime lifecycle migration (013).
     '013_sandboxes.sql',
+    // The MKT-009 history-ledger erratum correction appends the corrective
+    // migration (014): the workflow_instance_transitions from_status
+    // consistency backstop (spec/errata/MKT-009-history-ledger.md).
+    '014_workflow_instance_history_backstop.sql',
   ]);
   // The object-store fs/memory/s3 adapter dirs each hold exactly one implementation.
   for (const dir of ['cache', 'locking', 'objects', 'secrets']) {
