@@ -187,6 +187,30 @@ async function driveToRunning(
   return version;
 }
 
+/**
+ * Provisions + prepares one READY sandbox in the test workspace through the
+ * MKT-012 sandbox surface (leases reference real provisioned sandboxes
+ * since migration 013 — the lease-contract DB trigger is the backstop).
+ */
+async function provisionReadySandbox(
+  body: Record<string, unknown>,
+  token: string,
+): Promise<string> {
+  const provision = await apiCall(port(), `/api/workspaces/${workspaceId}/sandboxes`, {
+    token,
+    body,
+  });
+  assert.equal(provision.status, 201, JSON.stringify(provision.body));
+  const sandboxId = (provision.body['sandbox'] as Record<string, unknown>)['sandboxId'] as string;
+  const prepared = await apiCall(port(), `/api/sandboxes/${sandboxId}/prepare`, {
+    token,
+    body: { idempotencyKey: `prepare:${sandboxId}` },
+  });
+  assert.equal(prepared.status, 200, JSON.stringify(prepared.body));
+  assert.equal((prepared.body['sandbox'] as Record<string, unknown>)['status'], 'ready');
+  return sandboxId;
+}
+
 const owner: User = { userId: '', token: '' };
 const operator: User = { userId: '', token: '' };
 const foreign: User = { userId: '', token: '' };
@@ -1154,26 +1178,40 @@ test('the SANDBOX LEASE: eligibility, one-active fences, idempotent acquisition,
   assert.equal(pooledLease.status, 409);
   assert.match(JSON.stringify(pooledLease.body), /pooled-worker/);
 
-  // Happy acquisition: the v1.2 lease tuple, server-derived scope.
+  // Real provisioned READY sandboxes (MKT-012: a lease references a
+  // provisioned sandbox of the execution's class and scope — the DB
+  // lease-contract trigger is the backstop).
+  const mainSandboxId = await provisionReadySandbox(
+    { runtimeClass: 'persistent-sandbox', environmentIdentity: 'sbx-main-1', idempotencyKey: 'sbx-main-1' },
+    owner.token,
+  );
+  const secondSandboxId = await provisionReadySandbox(
+    { runtimeClass: 'persistent-sandbox', environmentIdentity: 'sbx-main-2', idempotencyKey: 'sbx-main-2' },
+    owner.token,
+  );
+
+  // Happy acquisition: the v1.2 lease tuple, server-derived scope, the
+  // sandbox's declared concurrency contract recorded.
   const acquired = await apiCall(port(), `/api/executions/${executionId}/sandbox-leases`, {
     token: owner.token,
-    body: { sandboxId: 'sbx-main-1', idempotencyKey: 'lease-1:acquire-1' },
+    body: { sandboxId: mainSandboxId, idempotencyKey: 'lease-1:acquire-1' },
   });
   assert.equal(acquired.status, 201, JSON.stringify(acquired.body));
   const lease = acquired.body['lease'] as Record<string, unknown>;
   const leaseId = lease['sandboxLeaseId'] as string;
-  assert.equal(lease['sandboxId'], 'sbx-main-1');
+  assert.equal(lease['sandboxId'], mainSandboxId);
   assert.equal(lease['executionId'], executionId);
   assert.equal(lease['workspaceId'], workspaceId);
   assert.equal(lease['clientId'], clientId);
   assert.equal(lease['status'], 'active');
+  assert.equal(lease['concurrencyContract'], 'exclusive');
   assert.equal(lease['releasedAt'], undefined);
   assert.equal(lease['version'], 1);
 
   // Duplicate acquisition command converges to the SAME ACTIVE lease.
   const replay = await apiCall(port(), `/api/executions/${executionId}/sandbox-leases`, {
     token: owner.token,
-    body: { sandboxId: 'sbx-main-1', idempotencyKey: 'lease-1:acquire-1' },
+    body: { sandboxId: mainSandboxId, idempotencyKey: 'lease-1:acquire-1' },
   });
   assert.equal(replay.status, 200);
   assert.equal(replay.body['replayed'], true);
@@ -1183,19 +1221,20 @@ test('the SANDBOX LEASE: eligibility, one-active fences, idempotent acquisition,
   // per execution).
   const secondOwn = await apiCall(port(), `/api/executions/${executionId}/sandbox-leases`, {
     token: owner.token,
-    body: { sandboxId: 'sbx-main-2', idempotencyKey: 'lease-1:acquire-2' },
+    body: { sandboxId: secondSandboxId, idempotencyKey: 'lease-1:acquire-2' },
   });
   assert.equal(secondOwn.status, 409);
   assert.match(JSON.stringify(secondOwn.body), /already holds an active sandbox lease/);
 
   // Another execution cannot control the same sandbox (exactly one
-  // permitted controller).
+  // permitted controller — the same sandbox class so the contention is
+  // the one-active-controller fence, not the class match).
   const other = await createExecution(
     {
       workflowInstanceId: REFERENCE_INSTANCE,
       nodeId: 'lease-node-b',
       executionKind: 'ai',
-      runtimeClass: 'ephemeral-sandbox',
+      runtimeClass: 'persistent-sandbox',
       idempotencyKey: 'lease-2',
     },
     owner.token,
@@ -1204,7 +1243,7 @@ test('the SANDBOX LEASE: eligibility, one-active fences, idempotent acquisition,
   await driveToRunning(otherId, owner.token, 'lease-2');
   const contested = await apiCall(port(), `/api/executions/${otherId}/sandbox-leases`, {
     token: owner.token,
-    body: { sandboxId: 'sbx-main-1', idempotencyKey: 'lease-2:acquire-1' },
+    body: { sandboxId: mainSandboxId, idempotencyKey: 'lease-2:acquire-1' },
   });
   assert.equal(contested.status, 409);
   assert.match(JSON.stringify(contested.body), /already controlled by an active lease/);
@@ -1283,7 +1322,7 @@ test('the SANDBOX LEASE: eligibility, one-active fences, idempotent acquisition,
   // lease was released; re-acquire needs a new key).
   const reAcquireOldKey = await apiCall(port(), `/api/executions/${executionId}/sandbox-leases`, {
     token: owner.token,
-    body: { sandboxId: 'sbx-main-1', idempotencyKey: 'lease-1:acquire-1' },
+    body: { sandboxId: mainSandboxId, idempotencyKey: 'lease-1:acquire-1' },
   });
   assert.equal(reAcquireOldKey.status, 409);
   assert.match(JSON.stringify(reAcquireOldKey.body), /released/);
@@ -1303,12 +1342,23 @@ test('a STALE lease is reclaimed through the idempotent release and the sandbox 
   const executionId = (created.body['execution'] as Record<string, unknown>)['executionId'] as string;
   await driveToRunning(executionId, owner.token, 'stale-1');
 
+  // Real provisioned READY sandboxes (the lease references a provisioned
+  // sandbox of the execution's class and scope).
+  const staleSandboxA = await provisionReadySandbox(
+    { runtimeClass: 'persistent-sandbox', environmentIdentity: 'sbx-stale-1', idempotencyKey: 'sbx-stale-1' },
+    owner.token,
+  );
+  const staleSandboxB = await provisionReadySandbox(
+    { runtimeClass: 'persistent-sandbox', environmentIdentity: 'sbx-stale-2', idempotencyKey: 'sbx-stale-2' },
+    owner.token,
+  );
+
   // Acquire with expiry metadata already in the past: the deterministic
   // stale-lease setup (no sleeps).
   const acquired = await apiCall(port(), `/api/executions/${executionId}/sandbox-leases`, {
     token: owner.token,
     body: {
-      sandboxId: 'sbx-stale-1',
+      sandboxId: staleSandboxA,
       idempotencyKey: 'stale-1:acquire',
       expiresAt: '2020-01-01T00:00:00.000Z',
     },
@@ -1320,7 +1370,7 @@ test('a STALE lease is reclaimed through the idempotent release and the sandbox 
   // The stale lease still BLOCKS a new controller until reclaimed...
   const blocked = await apiCall(port(), `/api/executions/${executionId}/sandbox-leases`, {
     token: owner.token,
-    body: { sandboxId: 'sbx-stale-2', idempotencyKey: 'stale-1:acquire-2' },
+    body: { sandboxId: staleSandboxB, idempotencyKey: 'stale-1:acquire-2' },
   });
   assert.equal(blocked.status, 409, 'the execution still holds its (stale) active lease');
 
@@ -1336,10 +1386,10 @@ test('a STALE lease is reclaimed through the idempotent release and the sandbox 
   // The sandbox is leaseable again (new key, new lease row).
   const reLeased = await apiCall(port(), `/api/executions/${executionId}/sandbox-leases`, {
     token: owner.token,
-    body: { sandboxId: 'sbx-stale-2', idempotencyKey: 'stale-1:acquire-2' },
+    body: { sandboxId: staleSandboxB, idempotencyKey: 'stale-1:acquire-2' },
   });
   assert.equal(reLeased.status, 201);
-  assert.equal((reLeased.body['lease'] as Record<string, unknown>)['sandboxId'], 'sbx-stale-2');
+  assert.equal((reLeased.body['lease'] as Record<string, unknown>)['sandboxId'], staleSandboxB);
 
   // Lease-history evidence: two leases, first released, second active.
   const history = await apiCall(port(), `/api/executions/${executionId}/sandbox-leases`, {
@@ -1445,6 +1495,14 @@ test('database backstops: direct SQL cannot cross the frozen machine, the identi
   );
   const executionId = (created.body['execution'] as Record<string, unknown>)['executionId'] as string;
   await driveToRunning(executionId, owner.token, 'backstop-1');
+
+  // A real READY ephemeral sandbox of this execution's class (the direct-SQL
+  // lease probes below reference it — the migration-013 lease-contract
+  // trigger validates existence/scope/class on every lease INSERT).
+  await provisionReadySandbox(
+    { runtimeClass: 'ephemeral-sandbox', idempotencyKey: 'sbx-backstop-ephemeral' },
+    owner.token,
+  );
 
   const db = new PgDb(stack!.env.databaseUrl, 2);
   try {
@@ -1617,20 +1675,32 @@ test('database backstops: direct SQL cannot cross the frozen machine, the identi
       ),
     );
     // --- One active lease per sandbox: the second active insert is rejected.
+    // --- (A real READY sandbox of this execution's class — the migration-013
+    // --- lease-contract trigger validates existence/scope/class/contract on
+    // --- every lease INSERT, direct SQL included.)
+    const backstopSandboxId = (
+      await db.query<{ sandbox_id: string }>(
+        `SELECT sandbox_id FROM sandboxes
+         WHERE workspace_id = $1 AND runtime_class = 'ephemeral-sandbox' AND status = 'ready'
+         ORDER BY created_at LIMIT 1`,
+        [workspaceId],
+      )
+    ).rows[0]?.sandbox_id;
+    assert.ok(backstopSandboxId !== undefined, 'a READY ephemeral sandbox exists from the earlier tests');
     const leaseResult = await db.query(
       `INSERT INTO execution_sandbox_leases (sandbox_lease_id, sandbox_id, execution_id,
                                               workspace_id, client_id, idempotency_key)
-       VALUES ($1, 'sbx-backstop-shared', $2, $3, $4, 'bs-lease-2')
+       VALUES ($1, $2, $3, $4, $5, 'bs-lease-2')
        RETURNING sandbox_lease_id`,
-      ['00000000-0000-4000-8000-000000000b09', executionId, workspaceId, clientId],
+      ['00000000-0000-4000-8000-000000000b09', backstopSandboxId, executionId, workspaceId, clientId],
     );
     assert.equal(leaseResult.rowCount, 1);
     await assert.rejects(
       db.query(
         `INSERT INTO execution_sandbox_leases (sandbox_lease_id, sandbox_id, execution_id,
                                                 workspace_id, client_id, idempotency_key)
-         VALUES ($1, 'sbx-backstop-shared', $2, $3, $4, 'bs-lease-3')`,
-        ['00000000-0000-4000-8000-000000000b0a', executionId, workspaceId, clientId],
+         VALUES ($1, $2, $3, $4, $5, 'bs-lease-3')`,
+        ['00000000-0000-4000-8000-000000000b0a', backstopSandboxId, executionId, workspaceId, clientId],
       ),
     );
     // --- Lease identity is immutable; a released lease is frozen.
@@ -1878,9 +1948,13 @@ test('lease mutations land in the audit trail with the lease target type', async
   );
   const executionId = (created.body['execution'] as Record<string, unknown>)['executionId'] as string;
   await driveToRunning(executionId, owner.token, 'audit-lease-1');
+  const auditSandboxId = await provisionReadySandbox(
+    { runtimeClass: 'persistent-sandbox', environmentIdentity: 'sbx-audit-1', idempotencyKey: 'sbx-audit-1' },
+    owner.token,
+  );
   const acquired = await apiCall(port(), `/api/executions/${executionId}/sandbox-leases`, {
     token: owner.token,
-    body: { sandboxId: 'sbx-audit-1', idempotencyKey: 'audit-lease-1:acquire' },
+    body: { sandboxId: auditSandboxId, idempotencyKey: 'audit-lease-1:acquire' },
   });
   const leaseId = (acquired.body['lease'] as Record<string, unknown>)['sandboxLeaseId'] as string;
   await apiCall(port(), `/api/executions/${executionId}/sandbox-leases/${leaseId}/release`, {

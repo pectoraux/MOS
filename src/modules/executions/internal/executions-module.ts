@@ -2,10 +2,11 @@
  * /executions module implementation (MKT-010 — the NORMALIZED EXECUTION
  * MODEL: one Execution identity and lifecycle for deterministic, AI, human
  * and extension execution; requirements.md EXEC-001; acceptance
- * EXEC-AC-01..03).
+ * EXEC-AC-01..03 — plus MKT-012 the sandbox runtime lifecycle, below).
  *
  * Owns the executions + execution_transitions +
- * execution_sandbox_leases tables (migration 011): the normalized runtime
+ * execution_sandbox_leases tables (migration 011) and the sandboxes +
+ * sandbox_transitions tables (migration 013): the normalized runtime
  * ATTEMPT identity (architecture.md §11: "An Execution is one concrete
  * operation identity for a Task"; "Execution is the unit that acquires
  * runtime resources") with its task linkage stored as REFERENCE DATA (the
@@ -18,6 +19,28 @@
  * through RECONCILING), the §8 database-enforced logical idempotency key,
  * the §24 retry classification with its explicit retry gate, and the
  * durable SANDBOX LEASE relationship (implementation-contract-v1.2.md §1).
+ *
+ * MKT-012 — the SANDBOX RUNTIME LIFECYCLE (work-items.md MKT-012 "implement
+ * ephemeral/persistent/dedicated sandbox contracts and lifecycle without
+ * creating a second execution authority"; RUNTIME-001 / RUNTIME-AC-01..04,
+ * the v1.2/v1.4 supersession of RUNTIME-AC-02): the runtime ENVIRONMENT
+ * identity chain the Architect's work order fixes —
+ *
+ *     Execution → Runtime Class → Sandbox → Lease → Worker / task execution
+ *
+ * — implemented as the sandbox entity (Workspace/Client-scoped identity
+ * tuple with NO execution ownership; ephemeral/persistent/dedicated
+ * classes; the declared concurrency contract), its FROZEN 8-edge lifecycle
+ * (REQUESTED → PREPARING → READY with FAILED/CANCELLED branches and the
+ * RELEASING/CANCELLED → RELEASED teardown paths), the driver-mediated
+ * provisioning/teardown protocols (state-driven convergence; the driver is
+ * a platform port, never an authority), and the contract-selected lease
+ * concurrency backstop. Per implementation-clarifications-v1.2.md "Runtime
+ * authority", this is the ONE authoritative runtime allocation boundary
+ * exposed by /executions — NOT a second runtime engine: a sandbox may
+ * never transition an Execution (nothing here mutates executions from the
+ * sandbox paths), and Workflow orchestration / AI-provider routing stay
+ * OUT of the sandbox layer.
  *
  * transitionExecution is the ONE authorized mutation port for execution
  * state ("Execution identity/lifecycle belongs only to /executions",
@@ -52,24 +75,48 @@ import type {
   ExecutionsModuleApi,
   ExecutionsModuleDeps,
   RuntimeClass,
+  SandboxConcurrencyContract,
+  SandboxLifecycleOutcome,
+  SandboxRecord,
+  SandboxStatus,
+  SandboxTransitionRecord,
 } from '../public.ts';
 import {
   EXECUTION_KINDS,
+  REUSABLE_SANDBOX_KINDS,
   RUNTIME_CLASSES,
+  SANDBOX_CONCURRENCY_CONTRACTS,
   SANDBOX_RUNTIME_CLASSES,
+  composeSandboxOwnerContext,
   isLegalExecutionTransition,
+  isLegalSandboxTransition,
   isTerminalExecutionStatus,
+  isTerminalSandboxStatus,
+  sandboxKindForRuntimeClass,
 } from '../public.ts';
 import { ExecutionsStore } from './executions-store.ts';
 import { SandboxLeasesStore } from './sandbox-leases-store.ts';
+import { SandboxesStore } from './sandboxes-store.ts';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const IDEMPOTENCY_KEY_MAX_LENGTH = 200;
 const EVIDENCE_REF_MAX_LENGTH = 512;
+/**
+ * Sandbox lifecycle COMMAND keys are bounded to 100 characters (tighter
+ * than the row-level §8 bound) because the protocol ops derive per-edge
+ * ledger keys from them (`<prefix>:<sandboxId>:<commandKey>:<edge>`) that
+ * must fit the 200-character transition-key bound.
+ */
+const SANDBOX_COMMAND_KEY_MAX_LENGTH = 100;
+const SANDBOX_ENVIRONMENT_IDENTITY_MAX_LENGTH = 200;
+const SANDBOX_CAPABILITY_MAX_LENGTH = 64;
+const SANDBOX_CAPABILITY_MAX_ITEMS = 16;
+const SANDBOX_PREPARE_ERROR_MAX_LENGTH = 2000;
 
 export function createExecutionsModule(deps: ExecutionsModuleDeps): ExecutionsModuleApi {
   const store = new ExecutionsStore(deps.db, deps.clock, deps.ids);
   const leases = new SandboxLeasesStore(deps.db, deps.clock, deps.ids);
+  const sandboxes = new SandboxesStore(deps.db, deps.clock, deps.ids);
 
   return {
     async createExecution(input) {
@@ -411,11 +458,6 @@ export function createExecutionsModule(deps: ExecutionsModuleDeps): ExecutionsMo
 
     async acquireExecutionSandboxLease(input) {
       assertIdempotencyKey(input.idempotencyKey);
-      if (input.sandboxId.length < 1 || input.sandboxId.length > 200) {
-        throw new InvalidRequestError('sandboxId must be between 1 and 200 characters', [
-          'sandboxId is the opaque sandbox reference (resolved by the runtime/sandbox authority)',
-        ]);
-      }
       let expiresAt: Date | null = null;
       if (input.expiresAt !== null) {
         expiresAt = new Date(input.expiresAt);
@@ -454,7 +496,7 @@ export function createExecutionsModule(deps: ExecutionsModuleDeps): ExecutionsMo
           return { lease: recorded, replayed: true };
         }
 
-        // (2) ELIGIBILITY (module guards; the DB trigger is the backstop):
+        // (2) ELIGIBILITY (module guards; the DB triggers are the backstop):
         // only a NON-TERMINAL execution whose runtime class is a SANDBOX
         // class acquires a runtime environment — a pooled-worker execution
         // holds no sandbox, and a terminal execution acquires no new
@@ -470,16 +512,50 @@ export function createExecutionsModule(deps: ExecutionsModuleDeps): ExecutionsMo
           );
         }
 
+        // (2b) THE SANDBOX SIDE of the relationship (module guards; the
+        // migration-013 lease-contract trigger is the backstop): the
+        // sandbox must EXIST, be READY, share the execution's client and
+        // workspace ("Cross-client sharing is forbidden"), and be of the
+        // SAME runtime class as the execution's declared class. The lease
+        // RECORDS the sandbox's declared concurrency contract —
+        // server-derived here, never caller-supplied.
+        if (!UUID_PATTERN.test(input.sandboxId)) {
+          throw new InvalidRequestError('sandboxId must be a sandbox identifier (UUID)', [
+            'sandboxId references the provisioned sandbox this lease controls',
+          ]);
+        }
+        const sandbox = await sandboxes.getSandbox(input.sandboxId);
+        if (sandbox === null) {
+          throw new NotFoundError('sandbox', input.sandboxId);
+        }
+        if (sandbox.status !== 'ready') {
+          throw new ConflictError(
+            `sandbox ${input.sandboxId} is ${sandbox.status}; only a READY sandbox can be leased`,
+          );
+        }
+        if (sandbox.clientId !== execution.clientId || sandbox.workspaceId !== execution.workspaceId) {
+          throw new ConflictError(
+            `sandbox ${input.sandboxId} belongs to workspace ${sandbox.workspaceId} of client ${sandbox.clientId}; cross-scope leasing is forbidden (execution ${execution.executionId} is in workspace ${execution.workspaceId} of client ${execution.clientId})`,
+          );
+        }
+        if (sandbox.runtimeClass !== execution.runtimeClass) {
+          throw new ConflictError(
+            `sandbox ${input.sandboxId} is of runtime class ${sandbox.runtimeClass}; execution ${execution.executionId} declares runtime class ${execution.runtimeClass} — the lease must match`,
+          );
+        }
+
         // (3) THE v1.2 CONCURRENCY BACKSTOP decides every contention the
         // row lock cannot see (another execution's lease on the same
         // sandbox, a second lease for this execution): the partial UNIQUE
-        // indexes reject exactly one permitted controller per sandbox and
-        // one active lease per execution.
+        // indexes reject a second active controller of an EXCLUSIVE
+        // sandbox and a second active lease for this execution (a
+        // concurrent-safe sandbox may hold multiple active leases).
         const inserted = await leases.insertSandboxLease(tx, {
           sandboxId: input.sandboxId,
           executionId: execution.executionId,
           workspaceId: execution.workspaceId,
           clientId: execution.clientId,
+          concurrencyContract: sandbox.concurrencyContract,
           idempotencyKey: input.idempotencyKey,
           expiresAt,
           actorId: input.actorId,
@@ -489,7 +565,7 @@ export function createExecutionsModule(deps: ExecutionsModuleDeps): ExecutionsMo
         }
         if (inserted === 'sandbox-controlled') {
           throw new ConflictError(
-            `sandbox ${input.sandboxId} is already controlled by an active lease; only one active lease may control a sandbox at a time`,
+            `sandbox ${input.sandboxId} is already controlled by an active lease; its declared concurrency contract is '${sandbox.concurrencyContract}' (only one active lease may control an exclusive sandbox at a time)`,
           );
         }
         if (inserted === 'execution-holds-lease') {
@@ -572,7 +648,625 @@ export function createExecutionsModule(deps: ExecutionsModuleDeps): ExecutionsMo
     async listReclaimableSandboxLeases(beforeIso) {
       return leases.listReclaimableSandboxLeases(beforeIso);
     },
+
+    async provisionSandbox(input) {
+      assertSandboxCommandKey(input.idempotencyKey);
+      if (!SANDBOX_RUNTIME_CLASSES.includes(input.runtimeClass)) {
+        throw new InvalidRequestError('runtimeClass must be one of the sandbox classes', [
+          `runtimeClass must be one of: ${SANDBOX_RUNTIME_CLASSES.join(', ')} — a pooled-worker execution holds no sandbox`,
+        ]);
+      }
+      const kind = sandboxKindForRuntimeClass(input.runtimeClass);
+      if (kind === null) {
+        throw new InvalidRequestError('runtimeClass must be one of the sandbox classes');
+      }
+      assertSandboxCapabilities(input.capabilities);
+      if (!SANDBOX_CONCURRENCY_CONTRACTS.includes(input.concurrencyContract)) {
+        throw new InvalidRequestError('concurrencyContract must be one of the declared runtime contracts', [
+          `concurrencyContract must be one of: ${SANDBOX_CONCURRENCY_CONTRACTS.join(', ')}`,
+        ]);
+      }
+      const reusable = REUSABLE_SANDBOX_KINDS.includes(kind);
+      if (reusable) {
+        if (
+          input.environmentIdentity === null ||
+          input.environmentIdentity.length < 1 ||
+          input.environmentIdentity.length > SANDBOX_ENVIRONMENT_IDENTITY_MAX_LENGTH
+        ) {
+          throw new InvalidRequestError(
+            `environmentIdentity is required for the ${kind} sandbox class and must be between 1 and ${SANDBOX_ENVIRONMENT_IDENTITY_MAX_LENGTH} characters`,
+            ['the caller-named environment key: one LIVE sandbox per workspace + runtime class + environment identity'],
+          );
+        }
+      } else if (input.environmentIdentity !== null) {
+        throw new InvalidRequestError(
+          'environmentIdentity must be omitted for the ephemeral sandbox class',
+          [
+            'the server generates a unique environment identity per ephemeral provisioning — an ephemeral environment is never reused',
+          ],
+        );
+      }
+      // The §8 fingerprint covers exactly the CALLER-VISIBLE command (the
+      // ephemeral nonce is deliberately excluded: a replay regenerates a
+      // different nonce and must still converge).
+      const fingerprint = fingerprintProvisionCommand({
+        runtimeClass: input.runtimeClass,
+        environmentIdentity: reusable ? input.environmentIdentity : null,
+        capabilities: input.capabilities,
+        concurrencyContract: input.concurrencyContract,
+      });
+
+      // Canonical Workspace owner resolution BEFORE any write (the scope is
+      // server-derived; a caller-supplied Workspace UUID is never an
+      // authorization).
+      const ownership = await deps.workspaces.resolveWorkspaceOwnership(input.workspaceId);
+      if (ownership === null) {
+        throw new NotFoundError('workspace', input.workspaceId);
+      }
+      const clientId = ownership.client.clientId;
+
+      return deps.db.transaction(async (tx) => {
+        // (1) §8 IDEMPOTENCE FIRST — before the boundary policy and before
+        // the reuse probe: a replay of an already-recorded logical command
+        // converges to its recorded outcome regardless of current boundary
+        // state (it creates nothing new). A key reused for a DIFFERENT
+        // logical command is a conflict.
+        const recorded = await sandboxes.findSandboxByIdempotencyKey(
+          tx,
+          input.workspaceId,
+          input.idempotencyKey,
+        );
+        if (recorded !== null) {
+          if (recorded.provisionFingerprint !== fingerprint) {
+            throw new ConflictError(
+              `idempotency key is already recorded by sandbox ${recorded.sandboxId} for a different logical command; one key identifies one logical provisioning command`,
+            );
+          }
+          return { sandbox: recorded, replayed: true };
+        }
+
+        // (2) THE REUSE PROBE (reusable classes only): a LIVE sandbox for
+        // the same (workspace, runtime class, environment identity)
+        // converges to it — "the same persistent sandbox may be reused" and
+        // "A crash must not create a second Sandbox". The §8 key is NOT
+        // consumed by this convergence (no row is created).
+        if (reusable) {
+          const live = await sandboxes.findLiveSandboxByEnvironment(
+            tx,
+            input.workspaceId,
+            input.runtimeClass,
+            input.environmentIdentity!,
+          );
+          if (live !== null) {
+            return { sandbox: live, replayed: true };
+          }
+        }
+
+        // (3) BOUNDARY POLICY: provisioning a runtime environment is NEW
+        // USE — the owning Workspace, its Client and the owning Agency must
+        // all be live and ACTIVE.
+        await assertBoundariesAllowNewUse(deps, input.workspaceId);
+
+        // (4) THE INSERT — born REQUESTED. The ephemeral environment
+        // identity (the never-reused nonce) is generated HERE, only on the
+        // insert path.
+        const sandboxId = deps.ids.newId();
+        const inserted = await sandboxes.insertSandbox(tx, {
+          sandboxId,
+          workspaceId: input.workspaceId,
+          clientId,
+          runtimeClass: input.runtimeClass,
+          environmentIdentity: reusable
+            ? input.environmentIdentity!
+            : deps.ids.newId(),
+          capabilities: input.capabilities,
+          concurrencyContract: input.concurrencyContract,
+          idempotencyKey: input.idempotencyKey,
+          provisionFingerprint: fingerprint,
+          actorId: input.actorId,
+        });
+        if (typeof inserted !== 'string') {
+          return { sandbox: inserted, replayed: false };
+        }
+        // (5) A fence fired outside the probes (a concurrent duplicate):
+        // converge exactly like the corresponding probe.
+        if (inserted === 'key-fence') {
+          const fenced = await sandboxes.findSandboxByIdempotencyKey(
+            tx,
+            input.workspaceId,
+            input.idempotencyKey,
+          );
+          if (fenced === null) {
+            throw new Error(
+              `sandbox idempotency fence fired for workspace ${input.workspaceId} key ${input.idempotencyKey} but no sandbox could be read back`,
+            );
+          }
+          if (fenced.provisionFingerprint !== fingerprint) {
+            throw new ConflictError(
+              `idempotency key is already recorded by sandbox ${fenced.sandboxId} for a different logical command; one key identifies one logical provisioning command`,
+            );
+          }
+          return { sandbox: fenced, replayed: true };
+        }
+        // environment-fence: a concurrent command provisioned the same LIVE
+        // environment first — converge to it.
+        if (reusable) {
+          const converged = await sandboxes.findLiveSandboxByEnvironment(
+            tx,
+            input.workspaceId,
+            input.runtimeClass,
+            input.environmentIdentity!,
+          );
+          if (converged !== null) {
+            return { sandbox: converged, replayed: true };
+          }
+        }
+        throw new ConflictError(
+          `sandbox environment (${input.runtimeClass}, ${input.environmentIdentity ?? 'ephemeral'}) is contended by a concurrent provisioning; retry the command`,
+        );
+      });
+    },
+
+    async prepareSandbox(input) {
+      assertSandboxCommandKey(input.idempotencyKey);
+      assertSandboxId(input.sandboxId);
+      const preparingKey = `sbxprep:${input.sandboxId}:${input.idempotencyKey}:preparing`;
+      const settleKey = `sbxprep:${input.sandboxId}:${input.idempotencyKey}:settle`;
+
+      // PHASE A — the recorded requested → preparing edge, if not yet
+      // applied (short transaction; state-driven dispatch).
+      const phaseA = await deps.db.transaction(async (tx) => {
+        const sandbox = await sandboxes.lockSandbox(tx, input.sandboxId);
+        if (sandbox === null) {
+          throw new NotFoundError('sandbox', input.sandboxId);
+        }
+        // IDEMPOTENCE FIRST: this command's recorded settle edge converges
+        // to the recorded outcome (the failed settle is reachable ONLY
+        // through this probe — a fresh command on a terminally failed
+        // sandbox is a conflict below).
+        const settled = await sandboxes.findSandboxTransitionByKey(
+          tx,
+          input.sandboxId,
+          settleKey,
+        );
+        if (settled !== null) {
+          return { kind: 'converged' as const, transition: settled };
+        }
+        if (sandbox.status === 'requested') {
+          const applied = await applySandboxEdge(tx, sandbox, 'preparing', preparingKey, {
+            resourceDescriptor: null,
+            prepareError: null,
+            reason: null,
+          }, input.actorId);
+          return { kind: 'proceed' as const, sandbox: applied.sandbox };
+        }
+        if (sandbox.status === 'preparing') {
+          // The crash window (recorded preparing, settle missing — possibly
+          // another command's) or a concurrent in-flight prepare: re-attempt
+          // the driver on the SAME sandbox and settle.
+          return { kind: 'proceed' as const, sandbox };
+        }
+        if (sandbox.status === 'ready') {
+          return { kind: 'state-converged' as const };
+        }
+        if (isTerminalSandboxStatus(sandbox.status)) {
+          throw new ConflictError(
+            `sandbox ${input.sandboxId} is ${sandbox.status} (terminal); it cannot be prepared`,
+          );
+        }
+        throw new ConflictError(
+          `sandbox ${input.sandboxId} is ${sandbox.status}; the teardown protocol owns it — prepare cannot run`,
+        );
+      });
+
+      if (phaseA.kind === 'converged') {
+        const current = await sandboxes.getSandbox(input.sandboxId);
+        if (current === null) {
+          throw new Error(`sandbox ${input.sandboxId} could not be read back`);
+        }
+        return { sandbox: current, transition: phaseA.transition, replayed: true };
+      }
+      if (phaseA.kind === 'state-converged') {
+        return deps.db.transaction(async (tx) => convergeSandboxOutcome(tx, sandboxes, input.sandboxId));
+      }
+
+      // PHASE B — the driver provisioning, OUTSIDE the row-lock
+      // transactions (at-least-once; the driver contract is idempotent per
+      // environment). Any failure settles the sandbox FAILED (fail-closed).
+      let resourceDescriptor: string | null = null;
+      let prepareFailure: string | null = null;
+      try {
+        const handle = await deps.sandboxDriver.prepare(
+          toEnvironmentRequest(phaseA.sandbox),
+        );
+        resourceDescriptor = handle.resourceDescriptor;
+        if (resourceDescriptor.length < 1 || resourceDescriptor.length > 512) {
+          prepareFailure = 'the sandbox driver returned an invalid resource descriptor';
+          resourceDescriptor = null;
+        }
+      } catch (error) {
+        prepareFailure = error instanceof Error ? error.message : String(error);
+      }
+
+      // PHASE C — the settle edge (short transaction; state-driven).
+      return deps.db.transaction(async (tx) => {
+        const sandbox = await sandboxes.lockSandbox(tx, input.sandboxId);
+        if (sandbox === null) {
+          throw new NotFoundError('sandbox', input.sandboxId);
+        }
+        const settled = await sandboxes.findSandboxTransitionByKey(
+          tx,
+          input.sandboxId,
+          settleKey,
+        );
+        if (settled !== null) {
+          const current = await sandboxes.rereadSandbox(tx, input.sandboxId);
+          if (current === null) {
+            throw new Error(`sandbox ${input.sandboxId} could not be read back`);
+          }
+          return { sandbox: current, transition: settled, replayed: true };
+        }
+        if (sandbox.status === 'preparing') {
+          if (prepareFailure !== null) {
+            const reason = boundedReason(prepareFailure);
+            const applied = await applySandboxEdge(
+              tx,
+              sandbox,
+              'failed',
+              settleKey,
+              { resourceDescriptor: null, prepareError: reason, reason },
+              input.actorId,
+            );
+            return { sandbox: applied.sandbox, transition: applied.transition, replayed: false };
+          }
+          const applied = await applySandboxEdge(
+            tx,
+            sandbox,
+            'ready',
+            settleKey,
+            { resourceDescriptor: resourceDescriptor!, prepareError: null, reason: null },
+            input.actorId,
+          );
+          return { sandbox: applied.sandbox, transition: applied.transition, replayed: false };
+        }
+        if (sandbox.status === 'ready' || sandbox.status === 'failed') {
+          // Another command's settle won the race — converge to the durable
+          // outcome (state-driven; the discarded handle is documented
+          // at-least-once behavior).
+          return convergeSandboxOutcome(tx, sandboxes, input.sandboxId);
+        }
+        throw new ConflictError(
+          `sandbox ${input.sandboxId} is ${sandbox.status}; the teardown protocol owns it — prepare cannot settle`,
+        );
+      });
+    },
+
+    async cancelSandbox(input) {
+      assertSandboxCommandKey(input.idempotencyKey);
+      assertSandboxId(input.sandboxId);
+      const cancelledKey = `sbxcxl:${input.sandboxId}:${input.idempotencyKey}:cancelled`;
+      const releasedKey = `sbxcxl:${input.sandboxId}:${input.idempotencyKey}:released`;
+
+      // PHASE A — the frozen cancel edge (preparing → cancelled or
+      // ready → cancelled), if not yet applied.
+      const phaseA = await deps.db.transaction(async (tx) => {
+        const sandbox = await sandboxes.lockSandbox(tx, input.sandboxId);
+        if (sandbox === null) {
+          throw new NotFoundError('sandbox', input.sandboxId);
+        }
+        if (sandbox.status === 'preparing' || sandbox.status === 'ready') {
+          await assertNoActiveLeases(tx, leases, sandbox);
+          const applied = await applySandboxEdge(tx, sandbox, 'cancelled', cancelledKey, {
+            resourceDescriptor: null,
+            prepareError: null,
+            reason: null,
+          }, input.actorId);
+          return { kind: 'proceed' as const, sandbox: applied.sandbox };
+        }
+        if (sandbox.status === 'cancelled') {
+          // A prior cancel stopped at the teardown (teardown failure or
+          // crash window): complete it.
+          return { kind: 'proceed' as const, sandbox };
+        }
+        if (sandbox.status === 'released') {
+          return { kind: 'state-converged' as const };
+        }
+        if (sandbox.status === 'requested') {
+          throw new ConflictError(
+            `sandbox ${input.sandboxId} is requested; REQUESTED's only forward edge is PREPARING (the frozen sandbox state machine) — prepare the sandbox first, then cancel it`,
+          );
+        }
+        if (sandbox.status === 'failed') {
+          throw new ConflictError(
+            `sandbox ${input.sandboxId} is failed (terminal); it cannot be cancelled`,
+          );
+        }
+        throw new ConflictError(
+          `sandbox ${input.sandboxId} is ${sandbox.status}; the release protocol owns it`,
+        );
+      });
+
+      if (phaseA.kind === 'state-converged') {
+        return deps.db.transaction(async (tx) => convergeSandboxOutcome(tx, sandboxes, input.sandboxId));
+      }
+
+      // PHASE B — the driver teardown, OUTSIDE the row-lock transactions
+      // (best-effort: a teardown failure propagates AFTER the cancel edge is
+      // durably applied — the sandbox stays CANCELLED and a later
+      // cancel/release retry completes it; "Release is idempotent and
+      // recoverable").
+      await deps.sandboxDriver.teardown(
+        toEnvironmentRequest(phaseA.sandbox),
+        phaseA.sandbox.resourceDescriptor,
+      );
+
+      // PHASE C — cancelled → released (the teardown completion edge).
+      return deps.db.transaction(async (tx) => {
+        const sandbox = await sandboxes.lockSandbox(tx, input.sandboxId);
+        if (sandbox === null) {
+          throw new NotFoundError('sandbox', input.sandboxId);
+        }
+        if (sandbox.status === 'cancelled') {
+          const applied = await applySandboxEdge(tx, sandbox, 'released', releasedKey, {
+            resourceDescriptor: null,
+            prepareError: null,
+            reason: null,
+          }, input.actorId);
+          return { sandbox: applied.sandbox, transition: applied.transition, replayed: false };
+        }
+        if (sandbox.status === 'released') {
+          return convergeSandboxOutcome(tx, sandboxes, input.sandboxId);
+        }
+        throw new ConflictError(
+          `sandbox ${input.sandboxId} is ${sandbox.status}; the cancel teardown cannot complete from here`,
+        );
+      });
+    },
+
+    async releaseSandbox(input) {
+      assertSandboxCommandKey(input.idempotencyKey);
+      assertSandboxId(input.sandboxId);
+      const releasingKey = `sbxrel:${input.sandboxId}:${input.idempotencyKey}:releasing`;
+      const releasedKey = `sbxrel:${input.sandboxId}:${input.idempotencyKey}:released`;
+
+      // PHASE A — the graceful entry edge (ready → releasing) when the
+      // sandbox is ready; a CANCELLED sandbox completes its teardown through
+      // this same protocol; a crash-window RELEASING sandbox re-drives.
+      const phaseA = await deps.db.transaction(async (tx) => {
+        const sandbox = await sandboxes.lockSandbox(tx, input.sandboxId);
+        if (sandbox === null) {
+          throw new NotFoundError('sandbox', input.sandboxId);
+        }
+        if (sandbox.status === 'ready') {
+          await assertNoActiveLeases(tx, leases, sandbox);
+          const applied = await applySandboxEdge(tx, sandbox, 'releasing', releasingKey, {
+            resourceDescriptor: null,
+            prepareError: null,
+            reason: null,
+          }, input.actorId);
+          return { kind: 'proceed' as const, sandbox: applied.sandbox };
+        }
+        if (sandbox.status === 'releasing' || sandbox.status === 'cancelled') {
+          return { kind: 'proceed' as const, sandbox };
+        }
+        if (sandbox.status === 'released') {
+          return { kind: 'state-converged' as const };
+        }
+        if (sandbox.status === 'requested') {
+          throw new ConflictError(
+            `sandbox ${input.sandboxId} is requested and has no environment to release (REQUESTED's only forward edge is PREPARING); prepare it first or provision a fresh sandbox`,
+          );
+        }
+        if (sandbox.status === 'preparing') {
+          throw new ConflictError(
+            `sandbox ${input.sandboxId} is preparing; a preparing sandbox is cancelled (PREPARING → CANCELLED), not released`,
+          );
+        }
+        throw new ConflictError(
+          `sandbox ${input.sandboxId} is ${sandbox.status} (terminal); it is already settled`,
+        );
+      });
+
+      if (phaseA.kind === 'state-converged') {
+        return deps.db.transaction(async (tx) => convergeSandboxOutcome(tx, sandboxes, input.sandboxId));
+      }
+
+      // PHASE B — the driver teardown, OUTSIDE the row-lock transactions.
+      await deps.sandboxDriver.teardown(
+        toEnvironmentRequest(phaseA.sandbox),
+        phaseA.sandbox.resourceDescriptor,
+      );
+
+      // PHASE C — the teardown completion edge (releasing → released or
+      // cancelled → released).
+      return deps.db.transaction(async (tx) => {
+        const sandbox = await sandboxes.lockSandbox(tx, input.sandboxId);
+        if (sandbox === null) {
+          throw new NotFoundError('sandbox', input.sandboxId);
+        }
+        if (sandbox.status === 'releasing' || sandbox.status === 'cancelled') {
+          const applied = await applySandboxEdge(tx, sandbox, 'released', releasedKey, {
+            resourceDescriptor: null,
+            prepareError: null,
+            reason: null,
+          }, input.actorId);
+          return { sandbox: applied.sandbox, transition: applied.transition, replayed: false };
+        }
+        if (sandbox.status === 'released') {
+          return convergeSandboxOutcome(tx, sandboxes, input.sandboxId);
+        }
+        throw new ConflictError(
+          `sandbox ${input.sandboxId} is ${sandbox.status}; the release teardown cannot complete from here`,
+        );
+      });
+    },
+
+    async getSandbox(sandboxId) {
+      return sandboxes.getSandbox(sandboxId);
+    },
+
+    async resolveSandboxOwnership(sandboxId) {
+      const sandbox = await sandboxes.getSandbox(sandboxId);
+      if (sandbox === null) return null;
+      // The scope chain resolves through the SAME canonical /workspaces
+      // authority as every workspace-scoped operation. A tombstoned
+      // boundary — or a broken client chain (impossible under the
+      // scope-chain trigger, guarded anyway) — never resolves (null —
+      // uniform 404 upstream).
+      const ownership = await deps.workspaces.resolveWorkspaceOwnership(sandbox.workspaceId);
+      if (ownership === null || ownership.client.clientId !== sandbox.clientId) {
+        return null;
+      }
+      return composeSandboxOwnerContext(
+        sandbox,
+        ownership.workspace,
+        ownership.client,
+        ownership.clientOwnership.agency,
+        deps.clock.nowIso(),
+      );
+    },
+
+    async listSandboxesForWorkspace(workspaceId) {
+      // Canonical owner resolution before dependent traversal (§2).
+      const ownership = await deps.workspaces.resolveWorkspaceOwnership(workspaceId);
+      if (ownership === null) {
+        throw new NotFoundError('workspace', workspaceId);
+      }
+      return sandboxes.listSandboxesForWorkspace(workspaceId);
+    },
+
+    async getSandboxTransitions(sandboxId) {
+      return sandboxes.listSandboxTransitions(sandboxId);
+    },
+
+    async listSandboxLeases(sandboxId) {
+      return leases.listSandboxLeasesBySandbox(sandboxId);
+    },
   };
+
+  // -------------------------------------------------------------------------
+  // Sandbox protocol helpers (close over the module's stores and driver).
+  // -------------------------------------------------------------------------
+
+  /** Builds the provider-neutral driver request for one sandbox record. */
+  function toEnvironmentRequest(sandbox: SandboxRecord) {
+    if (!SANDBOX_RUNTIME_CLASSES.includes(sandbox.runtimeClass)) {
+      // Impossible under the DB CHECK; defensive narrowing for the driver
+      // contract's sandbox-class union.
+      throw new Error(
+        `sandbox ${sandbox.sandboxId} carries runtime class ${sandbox.runtimeClass}, which is not a sandbox class`,
+      );
+    }
+    return {
+      sandboxId: sandbox.sandboxId,
+      clientId: sandbox.clientId,
+      workspaceId: sandbox.workspaceId,
+      runtimeClass: sandbox.runtimeClass as 'ephemeral-sandbox' | 'persistent-sandbox' | 'dedicated-runtime',
+      environmentIdentity: sandbox.environmentIdentity,
+      capabilities: sandbox.capabilities,
+    };
+  }
+
+  /**
+   * The state-convergence outcome: the CURRENT durable sandbox record with
+   * the LAST recorded transition as the settled-state evidence.
+   */
+  async function convergeSandboxOutcome(
+    tx: DbTransaction,
+    store: SandboxesStore,
+    sandboxId: string,
+  ): Promise<SandboxLifecycleOutcome> {
+    const current = await store.rereadSandbox(tx, sandboxId);
+    if (current === null) {
+      throw new Error(`sandbox ${sandboxId} could not be read back`);
+    }
+    const last = await store.lastSandboxTransition(tx, sandboxId);
+    if (last === null) {
+      throw new Error(`sandbox ${sandboxId} has no recorded transitions to converge to`);
+    }
+    return { sandbox: current, transition: last, replayed: true };
+  }
+
+  /**
+   * The teardown pre-gate (clean module error; the migration-013 DB
+   * release-gate trigger is the backstop): a sandbox cannot enter any
+   * teardown state while an ACTIVE lease controls it.
+   */
+  async function assertNoActiveLeases(
+    tx: DbTransaction,
+    leaseStore: SandboxLeasesStore,
+    sandbox: SandboxRecord,
+  ): Promise<void> {
+    const active = await leaseStore.countActiveLeasesForSandbox(tx, sandbox.sandboxId);
+    if (active > 0) {
+      throw new ConflictError(
+        `sandbox ${sandbox.sandboxId} is controlled by ${active} active lease(s); release the lease(s) first (the owning execution releases, or the deterministic stale-lease reclamation does)`,
+      );
+    }
+  }
+
+  /**
+   * ONE recorded + applied sandbox edge on the CALLER'S locked transaction:
+   * record-first (the from_status-consistency trigger re-enters under this
+   * lock), then the CAS row application with the target state's set-once
+   * payload evidence. The frozen-machine, identity-immutability and
+   * release-gate triggers are the database backstops behind this write.
+   */
+  async function applySandboxEdge(
+    tx: DbTransaction,
+    sandbox: SandboxRecord,
+    to: SandboxStatus,
+    idempotencyKey: string,
+    payload: {
+      readonly resourceDescriptor: string | null;
+      readonly prepareError: string | null;
+      readonly reason: string | null;
+    },
+    actorId: string | null,
+  ): Promise<{ sandbox: SandboxRecord; transition: SandboxTransitionRecord }> {
+    if (!isLegalSandboxTransition(sandbox.status, to)) {
+      throw new ConflictError(
+        `illegal sandbox transition ${sandbox.status} → ${to} (sandbox ${sandbox.sandboxId})`,
+      );
+    }
+    if (to === 'failed' && (payload.reason === null || payload.reason.length === 0)) {
+      throw new InvalidRequestError('a sandbox transition into failed must record its reason');
+    }
+    if (to === 'ready' && (payload.resourceDescriptor === null || payload.resourceDescriptor.length === 0)) {
+      throw new InvalidRequestError('a sandbox transition into ready must record its resource descriptor');
+    }
+    const inserted = await sandboxes.insertSandboxTransition(tx, {
+      sandboxId: sandbox.sandboxId,
+      idempotencyKey,
+      fromStatus: sandbox.status,
+      toStatus: to,
+      reason: payload.reason,
+      actorId,
+    });
+    if (inserted === 'fenced') {
+      // Impossible under the row lock (the ledger row and the row update
+      // commit atomically); a fence here is an invariant violation.
+      throw new Error(
+        `sandbox transition fence fired under the row lock for sandbox ${sandbox.sandboxId} key ${idempotencyKey}`,
+      );
+    }
+    const updated = await sandboxes.updateSandboxStatusRow(tx, {
+      sandboxId: sandbox.sandboxId,
+      status: to,
+      resourceDescriptor: to === 'ready' ? payload.resourceDescriptor : null,
+      prepareError: to === 'failed' ? payload.prepareError : null,
+      releasedAt: to === 'released' ? new Date(deps.clock.nowIso()) : null,
+      expectedVersion: sandbox.version,
+    });
+    if (updated !== 'ok') {
+      throw new Error(`sandbox ${sandbox.sandboxId} transition lost the version race`);
+    }
+    const reread = await sandboxes.rereadSandbox(tx, sandbox.sandboxId);
+    if (reread === null) {
+      throw new Error(`sandbox ${sandbox.sandboxId} could not be read back`);
+    }
+    return { sandbox: reread, transition: inserted };
+  }
 }
 
 /**
@@ -729,6 +1423,88 @@ function assertRuntimeClass(runtimeClass: RuntimeClass): void {
       `runtimeClass must be one of: ${RUNTIME_CLASSES.join(', ')}`,
     ]);
   }
+}
+
+/**
+ * Sandbox lifecycle COMMAND keys are bounded to 100 characters because the
+ * protocol ops derive per-edge ledger keys from them that must fit the
+ * 200-character transition-key bound.
+ */
+function assertSandboxCommandKey(key: string): void {
+  if (key.length < 1 || key.length > SANDBOX_COMMAND_KEY_MAX_LENGTH) {
+    throw new InvalidRequestError(
+      `idempotencyKey must be between 1 and ${SANDBOX_COMMAND_KEY_MAX_LENGTH} characters for sandbox lifecycle commands`,
+      [
+        'the sandbox protocol ops derive per-edge ledger keys from this key and must stay within the 200-character transition-key bound',
+      ],
+    );
+  }
+}
+
+function assertSandboxId(sandboxId: string): void {
+  if (!UUID_PATTERN.test(sandboxId)) {
+    throw new InvalidRequestError('sandboxId must be a sandbox identifier (UUID)', [
+      'sandboxId references the provisioned sandbox',
+    ]);
+  }
+}
+
+/** Declared required capabilities: bounded, plain, never credentials. */
+function assertSandboxCapabilities(capabilities: readonly string[]): void {
+  if (!Array.isArray(capabilities) || capabilities.length > SANDBOX_CAPABILITY_MAX_ITEMS) {
+    throw new InvalidRequestError(
+      `capabilities must be an array of at most ${SANDBOX_CAPABILITY_MAX_ITEMS} entries`,
+      [
+        'declared required capabilities are bounded strings — credentials are injected just-in-time and are never carried here (RUNTIME-AC-03)',
+      ],
+    );
+  }
+  for (const capability of capabilities) {
+    if (typeof capability !== 'string' || capability.length < 1 || capability.length > SANDBOX_CAPABILITY_MAX_LENGTH) {
+      throw new InvalidRequestError(
+        `every capability must be a string between 1 and ${SANDBOX_CAPABILITY_MAX_LENGTH} characters`,
+      );
+    }
+  }
+}
+
+/** Bounds a provisioning-failure message to the ledger/row limits. */
+function boundedReason(message: string): string {
+  const trimmed = message.trim();
+  if (trimmed.length === 0) {
+    return 'sandbox provisioning failed';
+  }
+  return trimmed.length > SANDBOX_PREPARE_ERROR_MAX_LENGTH
+    ? trimmed.slice(0, SANDBOX_PREPARE_ERROR_MAX_LENGTH)
+    : trimmed;
+}
+
+/**
+ * The §8 fingerprint of one logical provisioning command: a deterministic
+ * digest of WHAT the command provisions (runtime class, environment
+ * identity, capabilities, concurrency contract). The ephemeral nonce is
+ * deliberately EXCLUDED (it is server-generated on the insert path only —
+ * a replay regenerates a different nonce and must still converge). One key
+ * identifies one logical command: a key reused for a different command is
+ * a conflict.
+ */
+function fingerprintProvisionCommand(command: {
+  runtimeClass: RuntimeClass;
+  environmentIdentity: string | null;
+  capabilities: readonly string[];
+  concurrencyContract: SandboxConcurrencyContract;
+}): string {
+  return createHash('sha256')
+    .update(
+      JSON.stringify({
+        shape: 'provision',
+        runtimeClass: command.runtimeClass,
+        environmentIdentity: command.environmentIdentity,
+        capabilities: command.capabilities,
+        concurrencyContract: command.concurrencyContract,
+      }),
+    )
+    .digest('hex');
 }
 
 /**

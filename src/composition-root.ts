@@ -116,6 +116,7 @@ import { InMemoryMetrics } from './platform/observability/metrics.ts';
 import { InternalTokenAuthenticator } from './platform/http/auth/adapters/internal-token/internal-token-authenticator.ts';
 import { CompositeAuthenticator } from './platform/http/auth/adapters/composite/composite-authenticator.ts';
 import { FetchHttpCall } from './platform/http/outbound-fetch.ts';
+import { InProcessSandboxDriver } from './platform/sandboxes/adapters/in-process/in-process-sandbox-driver.ts';
 import { ConfigError } from './platform/errors/errors.ts';
 import type { AppServices } from './platform/app-services.ts';
 import type { ObservabilitySink } from './platform/observability/contract.ts';
@@ -208,6 +209,12 @@ function buildCore(config: AppConfig, options: AppOptions): Core {
   // wired here only — task runners depend on the HttpCallPort contract.
   const httpCalls = new FetchHttpCall();
 
+  // The sandbox environment driver (MKT-012): the default in-process
+  // SIMULATED substrate wired here only — the /executions sandbox lifecycle
+  // depends on the SandboxDriver contract, never on a concrete substrate
+  // (real isolation substrates are later composition-root adapters).
+  const sandboxDriver = new InProcessSandboxDriver();
+
   const primarySink = options.primarySink ?? new ConsoleSink();
   const sink =
     options.extraSinks === undefined || options.extraSinks.length === 0
@@ -243,7 +250,7 @@ function buildCore(config: AppConfig, options: AppOptions): Core {
   const goals = createGoalsModule({ db, clock, ids, clients, workspaces });
   const playbooks = createPlaybooksModule({ db, clock, ids, agencies, clients, goals });
   const workflows = createWorkflowsModule({ db, clock, ids, workspaces, playbooks });
-  const executions = createExecutionsModule({ db, clock, ids, workspaces });
+  const executions = createExecutionsModule({ db, clock, ids, workspaces, sandboxDriver });
 
   // Authentication order: user sessions first, then the internal service
   // token. Every path fails closed (CompositeAuthenticator).

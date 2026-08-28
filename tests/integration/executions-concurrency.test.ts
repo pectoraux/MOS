@@ -386,12 +386,26 @@ test('concurrent lease acquisition on ONE sandbox: exactly ONE permitted control
     contenders.push(executionId);
   }
 
+  // One real READY sandbox (MKT-012: leases reference provisioned
+  // sandboxes — both contenders share its class and scope).
+  const provision = await apiCall(port(), `/api/workspaces/${workspaceId}/sandboxes`, {
+    token: owner.token,
+    body: { runtimeClass: 'ephemeral-sandbox', idempotencyKey: 'sbx-race-1' },
+  });
+  assert.equal(provision.status, 201, JSON.stringify(provision.body));
+  const raceSandboxId = (provision.body['sandbox'] as Record<string, unknown>)['sandboxId'] as string;
+  const prepared = await apiCall(port(), `/api/sandboxes/${raceSandboxId}/prepare`, {
+    token: owner.token,
+    body: { idempotencyKey: `prepare:${raceSandboxId}` },
+  });
+  assert.equal(prepared.status, 200, JSON.stringify(prepared.body));
+
   // Both race for the SAME sandbox with distinct keys: one wins, one 409s.
   const results = await Promise.all(
     contenders.map((executionId, index) =>
       apiCall(port(), `/api/executions/${executionId}/sandbox-leases`, {
         token: owner.token,
-        body: { sandboxId: 'sbx-race-1', idempotencyKey: `lease-race-acquire-${index}` },
+        body: { sandboxId: raceSandboxId, idempotencyKey: `lease-race-acquire-${index}` },
       }),
     ),
   );
@@ -409,7 +423,7 @@ test('concurrent lease acquisition on ONE sandbox: exactly ONE permitted control
     Array.from({ length: 4 }, () =>
       apiCall(port(), `/api/executions/${winnerExecution}/sandbox-leases`, {
         token: owner.token,
-        body: { sandboxId: 'sbx-race-1', idempotencyKey: `lease-race-acquire-${winnerIndex}` },
+        body: { sandboxId: raceSandboxId, idempotencyKey: `lease-race-acquire-${winnerIndex}` },
       }),
     ),
   );
@@ -425,7 +439,8 @@ test('concurrent lease acquisition on ONE sandbox: exactly ONE permitted control
   try {
     const rows = await db.query<{ count: string }>(
       `SELECT count(*)::text AS count FROM execution_sandbox_leases
-       WHERE sandbox_id = 'sbx-race-1' AND status = 'active'`,
+       WHERE sandbox_id = $1 AND status = 'active'`,
+      [raceSandboxId],
     );
     assert.equal(rows.rows[0]!.count, '1');
   } finally {

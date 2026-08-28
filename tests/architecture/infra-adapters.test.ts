@@ -418,6 +418,8 @@ test('MKT-005: migrations 005/006 exist with exactly the expected numbering (no 
     '011_executions.sql',
     // MKT-011 appends the pooled dispatch outbox migration (012).
     '012_execution_dispatches.sql',
+    // MKT-012 appends the sandbox runtime lifecycle migration (013).
+    '013_sandboxes.sql',
   ]);
   // The object-store fs/memory/s3 adapter dirs each hold exactly one implementation.
   for (const dir of ['cache', 'locking', 'objects', 'secrets']) {

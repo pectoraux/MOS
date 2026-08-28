@@ -595,7 +595,11 @@ test('the /executions module internals hold exactly the expected files (module b
   assert.deepEqual(internalFiles, [
     'executions-module.ts',
     'executions-store.ts',
+    // MKT-012: the sandbox lifecycle persistence (sandboxes +
+    // sandbox_transitions, migration 013) lives on the SAME module — the
+    // execution/runtime contract exposed by /executions.
     'sandbox-leases-store.ts',
+    'sandboxes-store.ts',
   ]);
   assert.ok(
     existsSync(join(repoRoot, 'src', 'modules', 'executions', 'public.ts')),

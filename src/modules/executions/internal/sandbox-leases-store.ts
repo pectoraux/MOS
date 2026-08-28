@@ -1,20 +1,24 @@
 /**
  * /executions sandbox-lease persistence (execution_sandbox_leases table,
- * migration 011).
+ * migrations 011 + 013).
  *
  * The durable Execution→Sandbox relationship (implementation-contract-v1.2.md
  * §1 / tenant-runtime-v1.2.md). DB backstops:
  *   - the lease identity tuple (sandbox_lease_id + sandbox_id + execution_id
  *     + client_id + workspace_id), the acquisition provenance, the
  *     idempotency key and the expiry metadata are IMMUTABLE (trigger);
- *   - AT MOST ONE ACTIVE LEASE PER SANDBOX (partial UNIQUE index — "the
- *     backstop preventing two conflicting active leases for the same
- *     sandbox"; the strict v1.2 concurrency invariant, since no sandbox
- *     contract declaring safe concurrency exists before MKT-012);
+ *   - the lease records the sandbox's DECLARED CONCURRENCY CONTRACT at
+ *     acquisition (migration 013 — server-derived from the sandbox row,
+ *     immutable after acquisition) and the partial UNIQUE index enforces
+ *     the CONTRACT-SELECTED invariant: at most one ACTIVE lease per
+ *     EXCLUSIVE sandbox; a concurrent-safe sandbox may hold multiple active
+ *     leases ("unless its declared runtime contract explicitly permits
+ *     safe concurrent use");
  *   - at most ONE ACTIVE LEASE PER EXECUTION (partial UNIQUE index);
  *   - a lease can only be INSERTED for a NON-TERMINAL execution whose
- *     runtime class is a SANDBOX class (trigger — a pooled-worker execution
- *     holds no sandbox);
+ *     runtime class is a SANDBOX class (trigger), referencing an EXISTING,
+ *     READY sandbox of the SAME scope and runtime class, with the lease
+ *     recording the sandbox's concurrency contract (migration 013 trigger);
  *   - the ONLY legal lease mutation is ACTIVE → RELEASED with released_at
  *     recorded; released leases are frozen terminal rows (trigger);
  *   - (execution_id, idempotency_key) is UNIQUE-fenced — the lease
@@ -28,7 +32,7 @@
 import type { Clock } from '../../../platform/clock/clock.ts';
 import type { Db, DbRow, DbTransaction } from '../../../platform/db/contract.ts';
 import type { IdGenerator } from '../../../platform/ids/ids.ts';
-import type { SandboxLeaseRecord } from '../public.ts';
+import type { SandboxConcurrencyContract, SandboxLeaseRecord } from '../public.ts';
 
 interface SandboxLeaseRow extends DbRow {
   sandbox_lease_id: string;
@@ -37,6 +41,7 @@ interface SandboxLeaseRow extends DbRow {
   workspace_id: string;
   client_id: string;
   status: string;
+  concurrency_contract: string;
   acquired_by: string | null;
   released_at: Date | null;
   expires_at: Date | null;
@@ -48,8 +53,8 @@ interface SandboxLeaseRow extends DbRow {
 
 const SANDBOX_LEASE_SELECT = `
   SELECT sandbox_lease_id, sandbox_id, execution_id, workspace_id, client_id,
-         status, acquired_by, released_at, expires_at, version, idempotency_key,
-         created_at, updated_at
+         status, concurrency_contract, acquired_by, released_at, expires_at,
+         version, idempotency_key, created_at, updated_at
   FROM execution_sandbox_leases
 `;
 
@@ -82,6 +87,7 @@ export class SandboxLeasesStore {
       executionId: string;
       workspaceId: string;
       clientId: string;
+      concurrencyContract: SandboxConcurrencyContract;
       idempotencyKey: string;
       expiresAt: Date | null;
       actorId: string | null;
@@ -93,10 +99,11 @@ export class SandboxLeasesStore {
     try {
       result = await tx.query(
         `INSERT INTO execution_sandbox_leases (sandbox_lease_id, sandbox_id, execution_id,
-                                                workspace_id, client_id, status, acquired_by,
+                                                workspace_id, client_id, status,
+                                                concurrency_contract, acquired_by,
                                                 released_at, expires_at, version,
                                                 idempotency_key, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, 'active', $6, NULL, $7, 1, $8, $9, $9)
+         VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, NULL, $8, 1, $9, $10, $10)
          ON CONFLICT (execution_id, idempotency_key) DO NOTHING`,
         [
           leaseId,
@@ -104,6 +111,7 @@ export class SandboxLeasesStore {
           input.executionId,
           input.workspaceId,
           input.clientId,
+          input.concurrencyContract,
           input.actorId,
           input.expiresAt,
           input.idempotencyKey,
@@ -188,6 +196,29 @@ export class SandboxLeasesStore {
     return result.rows.map(toSandboxLeaseRecord);
   }
 
+  /** The leases ever held on one sandbox, oldest first — read-only evidence. */
+  async listSandboxLeasesBySandbox(sandboxId: string): Promise<readonly SandboxLeaseRecord[]> {
+    const result = await this.db.query<SandboxLeaseRow>(
+      `${SANDBOX_LEASE_SELECT} WHERE sandbox_id = $1 ORDER BY created_at, sandbox_lease_id`,
+      [sandboxId],
+    );
+    return result.rows.map(toSandboxLeaseRecord);
+  }
+
+  /**
+   * The count of ACTIVE leases controlling one sandbox, read THROUGH the
+   * caller's (locked) transaction — the module's clean-error teardown gate
+   * pre-check (the migration-013 release-gate trigger is the backstop).
+   */
+  async countActiveLeasesForSandbox(tx: DbTransaction, sandboxId: string): Promise<number> {
+    const result = await tx.query<{ count: number | string }>(
+      `SELECT count(*) AS count FROM execution_sandbox_leases
+       WHERE sandbox_id = $1 AND status = 'active'`,
+      [sandboxId],
+    );
+    return Number(result.rows[0]?.count ?? 0);
+  }
+
   /**
    * ACTIVE leases whose expiry metadata has passed — the stale/reclaimable
    * set ("A stale lease can be reclaimed through a durable recovery
@@ -230,6 +261,7 @@ function toSandboxLeaseRecord(row: SandboxLeaseRow): SandboxLeaseRecord {
     workspaceId: row.workspace_id,
     clientId: row.client_id,
     status: row.status as 'active' | 'released',
+    concurrencyContract: row.concurrency_contract as SandboxConcurrencyContract,
     acquiredBy: row.acquired_by,
     releasedAt: row.released_at === null ? null : row.released_at.toISOString(),
     expiresAt: row.expires_at === null ? null : row.expires_at.toISOString(),
