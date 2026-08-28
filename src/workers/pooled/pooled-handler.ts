@@ -7,21 +7,33 @@
  *   1. Load the dispatch + execution from durable state.
  *   2. TERMINAL execution → CONVERGED return (redelivery after completion
  *      mutates nothing — EXEC-AC-03).
- *   3. Recorded outcome without the terminal transition (crash between
+ *   3. RECONCILIATION OWNERSHIP — checked BEFORE the recorded-outcome
+ *      replay: an execution in unknown/reconciling is owned by the
+ *      explicit reconciliation path, and pooled redelivery is INERT
+ *      against it. A stale or reclaimed delivery can still carry a
+ *      recorded 'succeeded'/'unknown' verdict (the worker persisted the
+ *      outcome, then died before completing the queue job); replaying
+ *      that verdict would drive reconciling → succeeded | unknown — the
+ *      frozen reconciliation-decision edges (v1.2 §2) — synthesizing a
+ *      reconciliation decision from stale pooled-work evidence. NEVER.
+ *   4. Recorded outcome without the terminal transition (crash between
  *      outcome record and transition) → apply the terminal transition from
- *      the recorded verdict; the task is NEVER re-run.
- *   4. Tenant-controlled states: pausing/paused → record the
+ *      the recorded verdict; the task is NEVER re-run. (Reachable only
+ *      while the execution is still pooled-drivable — (3) keeps
+ *      reconciliation-owned executions out, and step() re-asserts the
+ *      same ownership after every CAS re-read, closing the version-race
+ *      window.)
+ *   5. Tenant-controlled states: pausing/paused → record the
  *      'deferred-paused' outcome and complete the job (the recovery pass
- *      re-arms a fresh cycle once the tenant resumes); unknown/reconciling
- *      → reconciliation owns the execution (never auto-driven).
- *   5. Drive the machine to running through the transition port
+ *      re-arms a fresh cycle once the tenant resumes).
+ *   6. Drive the machine to running through the transition port
  *      (created→queued→starting→running — belt-and-braces for crash
  *      windows; every edge idempotency-keyed per dispatch cycle).
- *   6. Run the task runner under the §8 LOGICAL TASK key (stable across
+ *   7. Run the task runner under the §8 LOGICAL TASK key (stable across
  *      retry ATTEMPTS — MKT-010's retry is a new execution row of the same
  *      linkage, so attempt 1 and attempt 2 derive the same task key and
  *      pure runners converge to ONE content-addressed artifact).
- *   7. Success → record the set-once outcome → running→succeeded.
+ *   8. Success → record the set-once outcome → running→succeeded.
  *      UnknownExternalOutcomeError → record outcome 'unknown' →
  *      running→unknown (never success, never blindly retried — frozen
  *      rule; reconciliation decides).
@@ -94,8 +106,31 @@ export function createPooledRunHandler(deps: PooledHandlerDeps): JobHandler {
       };
     }
 
-    // (3) Recorded outcome, missing terminal transition (crash window):
-    // apply the verdict WITHOUT re-running the task.
+    // (3) RECONCILIATION OWNERSHIP — deliberately BEFORE the recorded-
+    // outcome replay below: once the durable execution is unknown or
+    // reconciling, only the explicit reconciliation path may drive it. A
+    // stale/reclaimed delivery can still carry a recorded 'succeeded' or
+    // 'unknown' verdict; applying that verdict here would drive
+    // reconciling → succeeded | unknown — the frozen reconciliation-
+    // decision edges — from stale pooled-work evidence. The pooled path
+    // returns INERT (and step() re-asserts this after every CAS re-read).
+    if (isReconciliationOwned(execution.status)) {
+      // Reconciliation owns this execution — the pooled path never
+      // auto-drives an UNKNOWN outcome or a reconciliation decision
+      // (frozen rule, v1.2 §2).
+      return {
+        executionId: execution.executionId,
+        dispatchId: dispatch.dispatchId,
+        cycle: dispatch.cycle,
+        verdict: 'converged',
+        executionStatus: execution.status,
+      };
+    }
+
+    // (4) Recorded outcome, missing terminal transition (crash window):
+    // apply the verdict WITHOUT re-running the task. Reachable only while
+    // the execution is still pooled-drivable (e.g. running) — (3) already
+    // returned for reconciliation-owned executions.
     if (dispatch.outcome === 'succeeded' || dispatch.outcome === 'unknown') {
       execution = await applyRecordedOutcome(deps, dispatch, execution, dispatch.outcome);
       return {
@@ -108,7 +143,8 @@ export function createPooledRunHandler(deps: PooledHandlerDeps): JobHandler {
       };
     }
 
-    // (4) Tenant-controlled / reconciliation-owned states.
+    // (5) Tenant-controlled states (reconciliation-owned states returned
+    // inert at (3)).
     if (execution.status === 'pausing' || execution.status === 'paused') {
       await recordOutcomeConverging(deps, dispatch, 'deferred-paused', null, null, 'tenant paused the execution mid-dispatch');
       return {
@@ -119,19 +155,8 @@ export function createPooledRunHandler(deps: PooledHandlerDeps): JobHandler {
         executionStatus: execution.status,
       };
     }
-    if (execution.status === 'unknown' || execution.status === 'reconciling') {
-      // Reconciliation owns this execution — the pooled path never
-      // auto-drives an UNKNOWN outcome (frozen rule).
-      return {
-        executionId: execution.executionId,
-        dispatchId: dispatch.dispatchId,
-        cycle: dispatch.cycle,
-        verdict: 'converged',
-        executionStatus: execution.status,
-      };
-    }
 
-    // (5) Drive to running (idempotent; converges when already moved).
+    // (6) Drive to running (idempotent; converges when already moved).
     execution = await step(deps, dispatch, execution, 'queued');
     execution = await step(deps, dispatch, execution, 'starting');
     execution = await step(deps, dispatch, execution, 'running');
@@ -147,7 +172,7 @@ export function createPooledRunHandler(deps: PooledHandlerDeps): JobHandler {
       };
     }
 
-    // (6) Run the task under the §8 LOGICAL TASK key.
+    // (7) Run the task under the §8 LOGICAL TASK key.
     const runner = deps.runners.get(dispatch.taskKind);
     if (runner === undefined) {
       throw new PermanentExecutionFailureError(
@@ -167,7 +192,7 @@ export function createPooledRunHandler(deps: PooledHandlerDeps): JobHandler {
       });
     } catch (error) {
       if (isUnknownOutcomeError(error)) {
-        // (7b) UNKNOWN: record + transition; the JOB completes with the
+        // (8b) UNKNOWN: record + transition; the JOB completes with the
         // unknown verdict (it delivered its finding; the EXECUTION awaits
         // reconciliation).
         await recordOutcomeConverging(deps, dispatch, 'unknown', null, null, String((error as Error).message));
@@ -183,8 +208,8 @@ export function createPooledRunHandler(deps: PooledHandlerDeps): JobHandler {
       throw error;
     }
 
-    // (7a) Success: record the outcome FIRST (set-once), then the terminal
-    // transition — a crash between them re-enters at (3) and applies the
+    // (8a) Success: record the outcome FIRST (set-once), then the terminal
+    // transition — a crash between them re-enters at (4) and applies the
     // verdict without re-running the task.
     await recordOutcomeConverging(deps, dispatch, 'succeeded', result.outputRef, result.output, '');
     execution = await step(deps, dispatch, execution, 'succeeded', '');
@@ -197,6 +222,18 @@ export function createPooledRunHandler(deps: PooledHandlerDeps): JobHandler {
       outputRef: result.outputRef,
     };
   };
+}
+
+/**
+ * Reconciliation-owned statuses: once the durable execution is UNKNOWN or
+ * RECONCILING, only the explicit reconciliation path may drive it (frozen
+ * v1.2 rule — unknown is resolved by reconciliation on authoritative
+ * external evidence, never by pooled work). Every pooled-path decision
+ * that could touch such an execution must consult this predicate FIRST,
+ * including after CAS re-reads.
+ */
+function isReconciliationOwned(status: ExecutionStatus): boolean {
+  return status === 'unknown' || status === 'reconciling';
 }
 
 /** Payload envelope validation (poisoned payloads die permanently). */
@@ -221,7 +258,15 @@ function isUnknownOutcomeError(error: unknown): boolean {
 /**
  * One idempotent, CAS-tolerant lifecycle step keyed per dispatch cycle —
  * replays converge to the recorded transition; CAS losses re-read; an
- * illegal edge (state moved elsewhere) returns the current record.
+ * illegal edge (state moved elsewhere) returns the current record. A
+ * re-read that reveals reconciliation ownership (unknown/reconciling)
+ * returns the current record UNCHANGED: the pooled path never drives a
+ * transition FROM those states — the machine-legal edges out of them are
+ * reconciliation decisions, not ours to make (PR #20 blocking-finding
+ * correction; the guard is re-asserted on EVERY loop iteration, i.e. also
+ * after every CAS re-read, so a delivery that read a drivable status and
+ * then lost the version race to reconciliation stops instead of applying
+ * the newly-exposed reconciliation edge).
  */
 async function step(
   deps: PooledHandlerDeps,
@@ -234,6 +279,7 @@ async function step(
   for (let attempt = 0; attempt < 5; attempt += 1) {
     if (isTerminalExecutionStatus(execution.status)) return execution;
     if (execution.status === to) return execution;
+    if (isReconciliationOwned(execution.status)) return execution;
     if (!isLegalExecutionTransition(execution.status, to)) return execution;
     try {
       const outcome = await deps.executions.transitionExecution({
@@ -280,7 +326,7 @@ async function recordOutcomeConverging(
   }
 }
 
-/** Applies the terminal transition implied by a recorded outcome (3). */
+/** Applies the terminal transition implied by a recorded outcome (4). */
 async function applyRecordedOutcome(
   deps: PooledHandlerDeps,
   dispatch: ExecutionDispatchRecord,

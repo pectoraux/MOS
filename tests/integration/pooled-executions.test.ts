@@ -225,6 +225,46 @@ async function waitTerminal(executionId: string, token: string): Promise<Record<
   return result.body;
 }
 
+/** Drives ONE legal edge through the public transition port (the same authority the handler uses). */
+async function driveEdge(
+  executionId: string,
+  token: string,
+  to: string,
+  idempotencyKey: string,
+  evidenceRef?: string,
+): Promise<number> {
+  const current = await getExecution(executionId, token);
+  const response = await apiCall(port(), `/api/executions/${executionId}/transitions`, {
+    token,
+    body: {
+      to,
+      version: current.body['version'] as number,
+      idempotencyKey,
+      ...(evidenceRef === undefined ? {} : { evidenceRef }),
+    },
+  });
+  assert.equal(response.status, 200, `driveEdge → ${to}: ${JSON.stringify(response.body)}`);
+  return (response.body['execution'] as Record<string, unknown>)['version'] as number;
+}
+
+/** The execution's transition history as from→to pairs. */
+async function edgeList(executionId: string, token: string): Promise<string[]> {
+  const history = await getTransitions(executionId, token);
+  return (history.body['transitions'] as ReadonlyArray<Record<string, unknown>>).map(
+    (t) => `${t['fromStatus']}→${t['toStatus']}`,
+  );
+}
+
+/** Ages a job claim deterministically past the stale-claim window (at-least-once redelivery). */
+async function ageJobClaim(pg: { query: (sql: string, params?: unknown[]) => Promise<unknown> }, jobId: string): Promise<void> {
+  await pg.query(
+    `UPDATE platform_jobs SET status = 'running', attempts = 1, claimed_by = 'dead-worker',
+        claimed_at = now() - interval '30 seconds', version = version + 1
+     WHERE job_id = $1`,
+    [jobId],
+  );
+}
+
 // ---------------------------------------------------------------------------
 // RUNTIME-AC-01 — the pooled path handles normal AI/API/data tasks
 // ---------------------------------------------------------------------------
@@ -559,6 +599,347 @@ test('api.request timeout after send records UNKNOWN — never success, resolved
     'unknown→reconciling',
     'reconciling→succeeded',
   ]);
+});
+
+// ---------------------------------------------------------------------------
+// RECONCILIATION OWNERSHIP — the PR #20 blocking-finding regression: stale
+// pooled redelivery is INERT once reconciliation owns the Execution; only
+// the explicit reconciliation transition resolves it
+// ---------------------------------------------------------------------------
+
+test('regression (PR #20): stale redelivery carrying the recorded UNKNOWN verdict never drives a RECONCILING execution — only explicit reconciliation resolves it', async () => {
+  const { stack: st } = the();
+  const tenant = await makeTenant('ownunk');
+  const exec = await createPooledExecution(tenant, 'extension');
+
+  // (1) Pooled work records an outcome — the documented crash window,
+  // fabricated deterministically (the NATURAL recording of this exact
+  // verdict is proven end-to-end by the timeout-after-send test above):
+  // the worker claimed the job, ran the api.request task against the slow
+  // endpoint, recorded the 'unknown' verdict (timeout after send) and
+  // advanced the execution — then DIED before completing the queue job.
+  // The job row is durable (relay crash window) and carries the verdict.
+  const d = await dispatch(
+    exec.executionId,
+    {
+      taskKind: 'api.request',
+      input: { url: `http://127.0.0.1:${slowPort}/slow`, method: 'POST', body: '{}', timeoutMs: 150 },
+      idempotencyKey: 'dispatch-own-unk',
+    },
+    tenant.owner.token,
+  );
+  assert.equal(d.status, 201, JSON.stringify(d.body));
+  const dispatchRow = d.body['dispatch'] as Record<string, unknown>;
+  const dispatchId = dispatchRow['dispatchId'] as string;
+  const correlationId = dispatchRow['correlationId'] as string;
+
+  const job = await st.pg.pool.query<{ job_id: string }>(
+    `INSERT INTO platform_jobs (job_id, queue, handler_kind, payload, idempotency_key, status,
+                                attempts, max_attempts, run_after, correlation_id, submitted_by, version)
+     VALUES ($1, 'executions.pooled', 'executions.pooled.run',
+             $2::jsonb, $3, 'pending', 0, 5, now(), $4, 'recovery-test', 1)
+     RETURNING job_id`,
+    [
+      randomUUID(),
+      JSON.stringify({ dispatchId, executionId: exec.executionId, cycle: 1 }),
+      `execution-dispatch:${exec.executionId}:1`,
+      correlationId,
+    ],
+  );
+  const jobId = job.rows[0]!.job_id;
+
+  await st.pg.pool.query(
+    `UPDATE execution_dispatches
+        SET outcome = 'unknown', output = '{}'::jsonb,
+            outcome_reason = 'crash-window fabrication: unknown verdict persisted (timeout after send), worker died before completing the job',
+            version = version + 1, updated_at = now()
+      WHERE dispatch_id = $1`,
+    [dispatchId],
+  );
+
+  // The dead worker's own lifecycle drive (created→queued was applied by the
+  // dispatch command): queued→starting→running→unknown, through the same
+  // public transition port the handler itself uses.
+  await driveEdge(exec.executionId, tenant.owner.token, 'starting', 'own-unk-starting');
+  await driveEdge(exec.executionId, tenant.owner.token, 'running', 'own-unk-running');
+  await driveEdge(exec.executionId, tenant.owner.token, 'unknown', 'own-unk-unknown');
+
+  // (2) The Execution enters RECONCILING BEFORE the stale redelivery (the
+  // authorized reconciliation caller — the same public transition port).
+  const versionAtReconciling = await driveEdge(
+    exec.executionId,
+    tenant.owner.token,
+    'reconciling',
+    'own-unk-reconciling',
+  );
+  const edgesAtReconciling = await edgeList(exec.executionId, tenant.owner.token);
+  assert.deepEqual(edgesAtReconciling, [
+    'created→queued',
+    'queued→starting',
+    'starting→running',
+    'running→unknown',
+    'unknown→reconciling',
+  ]);
+
+  // (3) Stale/reclaimed pooled work is redelivered: the dead worker's claim
+  // is aged past the reclaim window (deterministic — the exact at-least-once
+  // redelivery the queue's stale-claim recovery performs).
+  await ageJobClaim(st.pg.pool, jobId);
+
+  const worker2 = await spawnWorker(st.env, { MOS_QUEUE_STALE_CLAIM_MS: '5000' });
+  assert.equal(await worker2.exitCode(), 0, 'the reclaimed delivery is processed and completes');
+
+  // (4) The worker did NOT mutate the reconciled Execution and did NOT
+  // synthesize a reconciliation decision (reconciling → unknown is a frozen
+  // reconciliation-decision edge — stale pooled evidence may not drive it).
+  const afterRedelivery = await getExecution(exec.executionId, tenant.owner.token);
+  assert.equal(afterRedelivery.body['status'], 'reconciling', 'reconciliation still owns the execution');
+  assert.equal(afterRedelivery.body['version'], versionAtReconciling, 'no version bump — nothing was mutated');
+  assert.deepEqual(
+    await edgeList(exec.executionId, tenant.owner.token),
+    edgesAtReconciling,
+    'no new transition row was synthesized',
+  );
+  const jobRow = await st.pg.pool.query<{ status: string; attempts: string; result: Record<string, unknown> }>(
+    `SELECT status, attempts::text AS attempts, result FROM platform_jobs WHERE job_id = $1`,
+    [jobId],
+  );
+  assert.equal(jobRow.rows[0]?.status, 'succeeded', 'the redelivered job itself completes (inert, not dead)');
+  assert.equal(jobRow.rows[0]?.attempts, '2', 'the stale claim was reclaimed as attempt 2');
+  assert.equal(
+    (jobRow.rows[0]!.result as { verdict?: string }).verdict,
+    'converged',
+    'the handler took the inert ownership branch (not the recorded-outcome replay)',
+  );
+
+  // (5) ONLY the explicit reconciliation transition resolves it — presented
+  // with the SAME CAS version captured before the redelivery (any pooled
+  // mutation would have bumped it and failed this command).
+  const r2 = await apiCall(port(), `/api/executions/${exec.executionId}/transitions`, {
+    token: tenant.owner.token,
+    body: {
+      to: 'succeeded',
+      version: versionAtReconciling,
+      idempotencyKey: 'own-unk-resolve',
+      evidenceRef: 'evidence:provider-log:own-unk',
+    },
+  });
+  assert.equal(r2.status, 200, JSON.stringify(r2.body));
+  assert.equal((r2.body['execution'] as Record<string, unknown>)['status'], 'succeeded');
+
+  const finalHistory = await getTransitions(exec.executionId, tenant.owner.token);
+  const finalTransitions = finalHistory.body['transitions'] as ReadonlyArray<Record<string, unknown>>;
+  assert.deepEqual(
+    finalTransitions.map((t) => `${t['fromStatus']}→${t['toStatus']}`),
+    [
+      'created→queued',
+      'queued→starting',
+      'starting→running',
+      'running→unknown',
+      'unknown→reconciling',
+      'reconciling→succeeded',
+    ],
+  );
+  const resolving = finalTransitions[finalTransitions.length - 1]!;
+  assert.equal(resolving['idempotencyKey'], 'own-unk-resolve', 'the resolution is authored by the explicit reconciliation command');
+  assert.equal(resolving['evidenceRef'], 'evidence:provider-log:own-unk', 'the resolution carries authoritative external evidence');
+});
+
+test('regression (PR #20): a recorded SUCCEEDED verdict on stale work never synthesizes reconciling → succeeded', async () => {
+  const { stack: st } = the();
+  const tenant = await makeTenant('ownsuc');
+  const exec = await createPooledExecution(tenant, 'deterministic');
+
+  // (1) Pooled work records an outcome — the documented crash window,
+  // fabricated deterministically: the worker persisted the 'succeeded'
+  // verdict and died before the terminal transition (the set-once outcome
+  // backstop permits exactly this first recording), and the queue job is
+  // durable (the relay crash window — same fabrication as the outbox
+  // recovery test).
+  const d = await dispatch(
+    exec.executionId,
+    { taskKind: 'data.transform', input: { records: [{ v: 1 }] }, idempotencyKey: 'dispatch-own-suc' },
+    tenant.owner.token,
+  );
+  assert.equal(d.status, 201, JSON.stringify(d.body));
+  const dispatchRecordRow = d.body['dispatch'] as Record<string, unknown>;
+  const dispatchId = dispatchRecordRow['dispatchId'] as string;
+  const correlationId = dispatchRecordRow['correlationId'] as string;
+
+  const fakeOutputRef = 'f'.repeat(64);
+  await st.pg.pool.query(
+    `UPDATE execution_dispatches
+        SET outcome = 'succeeded', output_ref = $2, output = '{}'::jsonb,
+            outcome_reason = 'crash-window fabrication: verdict persisted, worker died before the terminal transition',
+            version = version + 1, updated_at = now()
+      WHERE dispatch_id = $1`,
+    [dispatchId, fakeOutputRef],
+  );
+  const job = await st.pg.pool.query<{ job_id: string }>(
+    `INSERT INTO platform_jobs (job_id, queue, handler_kind, payload, idempotency_key, status,
+                                attempts, max_attempts, run_after, correlation_id, submitted_by, version)
+     VALUES ($1, 'executions.pooled', 'executions.pooled.run',
+             $2::jsonb, $3, 'pending', 0, 5, now(), $4, 'recovery-test', 1)
+     RETURNING job_id`,
+    [
+      randomUUID(),
+      JSON.stringify({ dispatchId, executionId: exec.executionId, cycle: 1 }),
+      `execution-dispatch:${exec.executionId}:1`,
+      correlationId,
+    ],
+  );
+  const jobId = job.rows[0]!.job_id;
+
+  // (2) The Execution enters RECONCILING BEFORE the stale redelivery — the
+  // racing narrative's durable state: a competing delivery drove
+  // running→unknown and reconciliation took ownership while the succeeded
+  // verdict sat recorded as pooled-work evidence.
+  await driveEdge(exec.executionId, tenant.owner.token, 'starting', 'own-suc-starting');
+  await driveEdge(exec.executionId, tenant.owner.token, 'running', 'own-suc-running');
+  await driveEdge(exec.executionId, tenant.owner.token, 'unknown', 'own-suc-unknown');
+  const versionAtReconciling = await driveEdge(exec.executionId, tenant.owner.token, 'reconciling', 'own-suc-reconciling');
+  const edgesAtReconciling = await edgeList(exec.executionId, tenant.owner.token);
+  assert.deepEqual(edgesAtReconciling, [
+    'created→queued',
+    'queued→starting',
+    'starting→running',
+    'running→unknown',
+    'unknown→reconciling',
+  ]);
+
+  // (3) Stale/reclaimed pooled work is redelivered past the reclaim window.
+  await ageJobClaim(st.pg.pool, jobId);
+  const worker = await spawnWorker(st.env, { MOS_QUEUE_STALE_CLAIM_MS: '5000' });
+  assert.equal(await worker.exitCode(), 0, 'the reclaimed delivery is processed and completes');
+
+  // (4) The worker did NOT mutate the reconciled Execution and did NOT
+  // synthesize the reconciliation decision (reconciling → succeeded with
+  // pooled idempotency keys and NO evidence is exactly what must never
+  // happen).
+  const afterRedelivery = await getExecution(exec.executionId, tenant.owner.token);
+  assert.equal(afterRedelivery.body['status'], 'reconciling', 'the stale succeeded verdict did not resolve the execution');
+  assert.equal(afterRedelivery.body['version'], versionAtReconciling, 'no version bump — nothing was mutated');
+  assert.deepEqual(
+    await edgeList(exec.executionId, tenant.owner.token),
+    edgesAtReconciling,
+    'no synthesized reconciliation edge',
+  );
+  const jobRow = await st.pg.pool.query<{ status: string; attempts: string; result: Record<string, unknown> }>(
+    `SELECT status, attempts::text AS attempts, result FROM platform_jobs WHERE job_id = $1`,
+    [jobId],
+  );
+  assert.equal(jobRow.rows[0]?.status, 'succeeded', 'the redelivered job completes (inert)');
+  assert.equal(jobRow.rows[0]?.attempts, '2', 'reclaimed as attempt 2');
+  assert.equal((jobRow.rows[0]!.result as { verdict?: string }).verdict, 'converged', 'the inert ownership branch');
+
+  // (5) ONLY the explicit reconciliation transition resolves it, WITH the
+  // authoritative evidence only reconciliation may present.
+  const r2 = await apiCall(port(), `/api/executions/${exec.executionId}/transitions`, {
+    token: tenant.owner.token,
+    body: {
+      to: 'succeeded',
+      version: versionAtReconciling,
+      idempotencyKey: 'own-suc-resolve',
+      evidenceRef: 'evidence:provider-ledger:own-suc',
+    },
+  });
+  assert.equal(r2.status, 200, JSON.stringify(r2.body));
+
+  const finalTransitions = (await getTransitions(exec.executionId, tenant.owner.token)).body[
+    'transitions'
+  ] as ReadonlyArray<Record<string, unknown>>;
+  assert.deepEqual(
+    finalTransitions.map((t) => `${t['fromStatus']}→${t['toStatus']}`),
+    [
+      'created→queued',
+      'queued→starting',
+      'starting→running',
+      'running→unknown',
+      'unknown→reconciling',
+      'reconciling→succeeded',
+    ],
+  );
+  const resolving = finalTransitions[finalTransitions.length - 1]!;
+  assert.equal(resolving['idempotencyKey'], 'own-suc-resolve', 'authored by the explicit reconciliation command, not pooled keys');
+  assert.equal(resolving['evidenceRef'], 'evidence:provider-ledger:own-suc');
+});
+
+test('regression (PR #20): recorded-outcome crash recovery is PRESERVED — a running execution with a recorded SUCCEEDED verdict converges without re-running the task', async () => {
+  const { stack: st } = the();
+  const tenant = await makeTenant('ownkeep');
+  const exec = await createPooledExecution(tenant, 'deterministic');
+
+  // The task input is POISONED: the data.transform runner would permanently
+  // reject it if it were ever invoked — proving the crash-window replay
+  // applies the recorded verdict WITHOUT re-running the task.
+  const d = await dispatch(
+    exec.executionId,
+    { taskKind: 'data.transform', input: { poisoned: true }, idempotencyKey: 'dispatch-own-keep' },
+    tenant.owner.token,
+  );
+  assert.equal(d.status, 201, JSON.stringify(d.body));
+  const dispatchRecordRow = d.body['dispatch'] as Record<string, unknown>;
+  const dispatchId = dispatchRecordRow['dispatchId'] as string;
+  const correlationId = dispatchRecordRow['correlationId'] as string;
+
+  // The relay crash window: the job is durable while the dispatch row is
+  // still 'recorded'.
+  const job = await st.pg.pool.query<{ job_id: string }>(
+    `INSERT INTO platform_jobs (job_id, queue, handler_kind, payload, idempotency_key, status,
+                                attempts, max_attempts, run_after, correlation_id, submitted_by, version)
+     VALUES ($1, 'executions.pooled', 'executions.pooled.run',
+             $2::jsonb, $3, 'pending', 0, 5, now(), $4, 'recovery-test', 1)
+     RETURNING job_id`,
+    [
+      randomUUID(),
+      JSON.stringify({ dispatchId, executionId: exec.executionId, cycle: 1 }),
+      `execution-dispatch:${exec.executionId}:1`,
+      correlationId,
+    ],
+  );
+
+  // The worker persisted the succeeded verdict and died BEFORE the terminal
+  // transition (deterministic crash-window fabrication).
+  const fakeOutputRef = 'e'.repeat(64);
+  await st.pg.pool.query(
+    `UPDATE execution_dispatches
+        SET outcome = 'succeeded', output_ref = $2, output = '{}'::jsonb,
+            outcome_reason = 'crash-window fabrication: verdict persisted, worker died before the terminal transition',
+            version = version + 1, updated_at = now()
+      WHERE dispatch_id = $1`,
+    [dispatchId, fakeOutputRef],
+  );
+
+  // The execution is still in the pooled-drivable crash-window state.
+  await driveEdge(exec.executionId, tenant.owner.token, 'starting', 'keep-starting');
+  await driveEdge(exec.executionId, tenant.owner.token, 'running', 'keep-running');
+
+  const worker = await spawnWorker(st.env);
+  assert.equal(await worker.exitCode(), 0);
+
+  // The recorded verdict applied — WITHOUT re-running the task (had the
+  // runner been invoked, the poisoned input would have killed the job and
+  // the sweep would have terminalized the execution failed).
+  const finalRow = await waitTerminal(exec.executionId, tenant.owner.token);
+  assert.equal(finalRow['status'], 'succeeded', 'running→succeeded applied from the recorded verdict');
+  assert.deepEqual(await edgeList(exec.executionId, tenant.owner.token), [
+    'created→queued',
+    'queued→starting',
+    'starting→running',
+    'running→succeeded',
+  ]);
+  const read = await getDispatch(exec.executionId, tenant.owner.token);
+  const record = read.body['dispatch'] as Record<string, unknown>;
+  assert.equal(record['outcome'], 'succeeded');
+  assert.equal(record['outputRef'], fakeOutputRef, 'the recorded artifact evidence is preserved verbatim');
+
+  const jobRow = await st.pg.pool.query<{ status: string; attempts: string; result: Record<string, unknown> }>(
+    `SELECT status, attempts::text AS attempts, result FROM platform_jobs WHERE job_id = $1`,
+    [job.rows[0]!.job_id],
+  );
+  assert.equal(jobRow.rows[0]?.status, 'succeeded', 'the runner was never invoked (poisoned input would have killed it)');
+  assert.equal(jobRow.rows[0]?.attempts, '1');
+  assert.equal((jobRow.rows[0]!.result as { verdict?: string }).verdict, 'succeeded');
 });
 
 // ---------------------------------------------------------------------------
