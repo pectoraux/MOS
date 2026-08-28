@@ -134,6 +134,7 @@ import { createGoalsModule } from './modules/goals/public.ts';
 import { createPlaybooksModule } from './modules/playbooks/public.ts';
 import { createWorkflowsModule } from './modules/workflows/public.ts';
 import { createExecutionsModule } from './modules/executions/public.ts';
+import { createEvidenceModule } from './modules/evidence/public.ts';
 import type { ApplicationModules } from './api/application.ts';
 
 export interface AppOptions {
@@ -251,6 +252,10 @@ function buildCore(config: AppConfig, options: AppOptions): Core {
   const playbooks = createPlaybooksModule({ db, clock, ids, agencies, clients, goals });
   const workflows = createWorkflowsModule({ db, clock, ids, workspaces, playbooks });
   const executions = createExecutionsModule({ db, clock, ids, workspaces, sandboxDriver });
+  // Dependency matrix: /evidence ──→ /workspaces (which composes /clients).
+  // The /executions dependency of /evidence is unused by MKT-013 (the
+  // frozen §13 record shape carries no execution ownership).
+  const evidence = createEvidenceModule({ db, clock, ids, workspaces });
 
   // Authentication order: user sessions first, then the internal service
   // token. Every path fails closed (CompositeAuthenticator).
@@ -278,7 +283,7 @@ function buildCore(config: AppConfig, options: AppOptions): Core {
         metrics,
       },
     },
-    modules: { users, auth, agencies, clients, workspaces, credentials, audit, goals, playbooks, workflows, executions },
+    modules: { users, auth, agencies, clients, workspaces, credentials, audit, goals, playbooks, workflows, executions, evidence },
   };
 }
 

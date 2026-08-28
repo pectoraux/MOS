@@ -46,7 +46,8 @@ export function auditActor(principal: Principal): string {
  * Agency → Client → Workspace → Workflow); executions are Workspace-scoped
  * the same way (Agency → Client → Workspace → Execution); sandboxes are
  * Workspace-scoped environments (Agency → Client → Workspace → Sandbox,
- * MKT-012).
+ * MKT-012); evidence records are Workspace-scoped
+ * (Agency → Client → Workspace → Evidence, MKT-013).
  */
 function ownerScopeAuditFields(owner: OwnerScope): {
   agencyId: string | null;
@@ -69,7 +70,9 @@ function ownerScopeAuditFields(owner: OwnerScope): {
               ? owner.clientId
               : owner.kind === 'sandbox'
                 ? owner.clientId
-                : null,
+                : owner.kind === 'evidence'
+                  ? owner.clientId
+                  : null,
     workspaceId:
       owner.kind === 'workspace'
         ? owner.workspaceId
@@ -81,7 +84,9 @@ function ownerScopeAuditFields(owner: OwnerScope): {
               ? owner.workspaceId
               : owner.kind === 'sandbox'
                 ? owner.workspaceId
-                : null,
+                : owner.kind === 'evidence'
+                  ? owner.workspaceId
+                  : null,
   };
 }
 

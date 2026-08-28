@@ -424,6 +424,8 @@ test('MKT-005: migrations 005/006 exist with exactly the expected numbering (no 
     // migration (014): the workflow_instance_transitions from_status
     // consistency backstop (spec/errata/MKT-009-history-ledger.md).
     '014_workflow_instance_history_backstop.sql',
+    // MKT-013 appends the evidence/provenance migration (015).
+    '015_evidence.sql',
   ]);
   // The object-store fs/memory/s3 adapter dirs each hold exactly one implementation.
   for (const dir of ['cache', 'locking', 'objects', 'secrets']) {
