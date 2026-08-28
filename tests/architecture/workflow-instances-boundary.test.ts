@@ -29,7 +29,14 @@
  *   4. the (workflow_instance_id, idempotency_key) UNIQUE fence on the
  *      append-only transition history exists (§5 "duplicate transition
  *      requests are idempotent") and the history table rejects UPDATE and
- *      DELETE (append-only evidence);
+ *      DELETE (append-only evidence) — and, per the MKT-009 history-ledger
+ *      erratum (spec/errata/MKT-009-history-ledger.md), the corrective
+ *      migration 014 REPLACES the history trigger function with the
+ *      current-status CONSISTENCY backstop: a recorded transition's
+ *      from_status must equal the instance's durable current status
+ *      (FOR UPDATE row resolution, fabricated-history and unknown-instance
+ *      rejection — the same integrity guarantee as the execution and
+ *      sandbox ledgers);
  *   5. the identity/pin/scope IMMUTABILITY triggers exist on
  *      workflow_instances (the pinned definition reference can never
  *      float; the instance can never cross the Workflow or tenant
@@ -60,8 +67,13 @@ import {
 } from '../../src/modules/workflows/public.ts';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+const migrationsDir = join(repoRoot, 'src', 'platform', 'db', 'migrations');
 const migration010 = readFileSync(
-  join(repoRoot, 'src', 'platform', 'db', 'migrations', '010_workflow_instances.sql'),
+  join(migrationsDir, '010_workflow_instances.sql'),
+  'utf8',
+);
+const migration014 = readFileSync(
+  join(migrationsDir, '014_workflow_instance_history_backstop.sql'),
   'utf8',
 );
 const workflowsPublic = readFileSync(
@@ -236,6 +248,62 @@ test('the DB backstops terminal immutability, the idempotency fence and the appe
   assert.ok(
     migration010.includes('workflow_instance_transitions_legal'),
     'an illegal pair cannot even be recorded as history',
+  );
+});
+
+test('the MKT-009 history-ledger erratum backstop: migration 014 gives the history trigger from_status consistency (spec/errata/MKT-009-history-ledger.md)', () => {
+  // Migration 010 itself remains UNTOUCHED (applied and
+  // checksummed-immutable on main): its history trigger verified only the
+  // legal pair. The correction lives in migration 014 as a CREATE OR
+  // REPLACE of the same trigger function — exactly the MKT-010 erratum
+  // correction pattern for execution_transitions_legal().
+  assert.ok(
+    !migration010.includes('fabricated applied transition rejected'),
+    'migration 010 itself is untouched (the backstop arrives via the corrective migration 014)',
+  );
+  assert.ok(
+    migration014.includes(
+      'CREATE OR REPLACE FUNCTION workflow_instance_transitions_legal()',
+    ),
+    'migration 014 replaces the history trigger function with the consistency-augmented body',
+  );
+  // The replaced body keeps the frozen-§5 legal-pair check FIRST (the
+  // illegal-pair rejection is unchanged defense in depth).
+  assert.ok(
+    migration014.includes('illegal workflow instance transition % → % cannot be recorded'),
+    'the replaced body keeps the frozen-§5 legal-pair check',
+  );
+  // THE CONSISTENCY BACKSTOP: the trigger resolves the instance's CURRENT
+  // durable status concurrency-safely (FOR UPDATE — the authorized writer
+  // already holds the row lock) and rejects fabricated history.
+  assert.ok(
+    /FROM workflow_instances\s+WHERE workflow_instance_id = NEW\.workflow_instance_id\s+FOR UPDATE/.test(
+      migration014.replace(/\s+/g, ' '),
+    ),
+    'the history trigger resolves the instance row concurrency-safely (FOR UPDATE)',
+  );
+  assert.ok(
+    migration014.includes('cannot record a transition for unknown workflow instance'),
+    'a history row for an unknown instance is rejected',
+  );
+  assert.ok(
+    migration014.includes('fabricated applied transition rejected'),
+    'a fabricated-but-legal history row whose from_status mismatches the durable status is rejected',
+  );
+  // No scope over-reach: the corrective migration changes ONLY the trigger
+  // function body — no table, no trigger wiring, no state machine, no
+  // authority change (WF-AC-04 intact).
+  assert.ok(
+    !migration014.includes('CREATE TABLE'),
+    'the corrective migration creates no table',
+  );
+  assert.ok(
+    !migration014.includes('CREATE TRIGGER'),
+    'the corrective migration rewires no trigger (the BEFORE INSERT wiring from migration 010 is unchanged)',
+  );
+  assert.ok(
+    !migration014.includes('ALTER TABLE'),
+    'the corrective migration alters no table shape',
   );
 });
 
