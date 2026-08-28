@@ -37,7 +37,13 @@
  *      legal-pair-checked with the to-failed-requires-reason payload
  *      contract, and carrying the MKT-010-audit-erratum applied-transition
  *      integrity backstop FROM DAY ONE (FOR UPDATE resolution + fabricated
- *      from_status rejection);
+ *      from_status rejection) — plus THE LEDGER-PRESERVING DELETE POLICY
+ *      (PR #21 review finding #5452651719): the ledger FK is NON-DESTRUCTIVE
+ *      (plain REFERENCES, NO ON DELETE CASCADE) and a direct SQL DELETE of
+ *      a sandbox row is REJECTED at the DB level by the unconditional
+ *      BEFORE DELETE trigger (the lifecycle's end is the RELEASED state,
+ *      never row erasure: DELETE sandbox → REJECT → sandbox remains,
+ *      sandbox_transitions remains);
  *   5. the row-level backstops: the frozen-machine trigger (legal edges,
  *      terminal immutability, set-once descriptor/error/released_at
  *      presence), the identity-immutability trigger (identity tuple,
@@ -323,6 +329,65 @@ test('the sandbox_transitions ledger is idempotency-fenced, append-only, legal-p
   assert.ok(
     consistent.includes('cannot record a transition for unknown sandbox'),
     'a history row for an unknown sandbox is rejected',
+  );
+});
+
+test('the ledger-preserving delete policy: non-destructive FK + DB-level Sandbox row DELETE rejection (PR #21 finding #5452651719)', () => {
+  // THE FK IS NON-DESTRUCTIVE: the ledger's reference to its subject is a
+  // plain REFERENCES with NO ON DELETE action — a Sandbox row DELETE can
+  // never cascade-erase the append-only lifecycle history through the
+  // relationship.
+  const ledgerBlock = createTableBlock(migration013, 'sandbox_transitions');
+  const sandboxIdColumn = ledgerBlock
+    .split('\n')
+    .map((line) => line.trim())
+    .find((line) => line.startsWith('sandbox_id '));
+  assert.ok(sandboxIdColumn !== undefined, 'sandbox_transitions.sandbox_id must exist');
+  assert.ok(
+    /^sandbox_id\s+uuid\s+NOT NULL REFERENCES sandboxes\(sandbox_id\),?$/.test(sandboxIdColumn),
+    'the ledger FK must be a plain non-destructive REFERENCES (sandbox_id uuid NOT NULL REFERENCES sandboxes(sandbox_id))',
+  );
+  assert.ok(
+    !sandboxIdColumn.includes('ON DELETE'),
+    'the ledger FK must carry NO ON DELETE action — CASCADE would let a Sandbox DELETE erase append-only history',
+  );
+  // Structural defense in depth: migration 013's executable SQL defines NO
+  // cascading delete anywhere (comments stripped — doc comments may state
+  // the rule itself).
+  const stripSqlComments = (source: string): string =>
+    source
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('\n')
+      .map((line) => {
+        const cut = line.indexOf('--');
+        return cut >= 0 ? line.slice(0, cut) : line;
+      })
+      .join('\n');
+  assert.ok(
+    !stripSqlComments(migration013).includes('ON DELETE CASCADE'),
+    'migration 013 must define no ON DELETE CASCADE relationship (the sandbox lifecycle history is non-destructive)',
+  );
+  // THE DB-LEVEL SANDBOX DELETE REJECTION: the unconditional BEFORE DELETE
+  // row trigger — DELETE sandbox → REJECT → sandbox remains,
+  // sandbox_transitions remains (the lifecycle's end is the RELEASED
+  // state, never row erasure). The FK alone would only guard sandboxes
+  // that already have recorded history; the trigger rejects the DELETE of
+  // ANY sandbox row, including a freshly provisioned REQUESTED row whose
+  // ledger is still empty.
+  const deleteRejected = functionBlock(migration013, 'sandboxes_delete_rejected');
+  assert.ok(
+    deleteRejected.includes('rows are never deleted'),
+    'the delete-rejection function raises unconditionally',
+  );
+  assert.ok(
+    !/IF\b|EXISTS\b/.test(deleteRejected),
+    'the delete-rejection function must be unconditional (no escape hatch)',
+  );
+  assert.ok(
+    migration013.includes(
+      'CREATE TRIGGER sandboxes_delete_rejected_trigger\n    BEFORE DELETE ON sandboxes\n    FOR EACH ROW EXECUTE FUNCTION sandboxes_delete_rejected()',
+    ),
+    'the BEFORE DELETE ON sandboxes row-level rejection trigger exists',
   );
 });
 

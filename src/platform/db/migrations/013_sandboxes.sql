@@ -76,6 +76,13 @@
 --     sandbox's durable current status — the fabricated-history backstop the
 --     MKT-010 audit erratum established for execution_transitions, applied
 --     to this ledger from day one (spec/errata/MKT-010-history-ledger.md);
+--   * THE LEDGER-PRESERVING DELETE POLICY: the sandbox_transitions FK is
+--     NON-DESTRUCTIVE (plain REFERENCES — NO ON DELETE CASCADE: deleting a
+--     sandbox row can never erase its lifecycle history through the
+--     relationship), and a direct SQL DELETE of a sandbox row is REJECTED
+--     at the DB level by the unconditional BEFORE DELETE trigger below —
+--     the sandbox row and its history remain. The lifecycle's end is the
+--     RELEASED state, never row erasure (PR #21 review finding #5452651719).
 --   * the sandbox DECLARED RUNTIME CONTRACT (tenant-runtime-v1.2.md: "Only
 --     one active lease may control a Sandbox at a time unless the Sandbox
 --     contract explicitly declares safe concurrency. The database must
@@ -197,11 +204,15 @@ CREATE INDEX IF NOT EXISTS sandboxes_workspace_idx
 
 -- ---------------------------------------------------------------------------
 -- The append-only applied-transition ledger (the record of every lifecycle
--- decision and the provisioning/teardown idempotency ledger).
+-- decision and the provisioning/teardown idempotency ledger). The FK to
+-- sandboxes is deliberately NON-DESTRUCTIVE (NO ON DELETE CASCADE): the
+-- ledger outlives every row-level accident — a sandbox row DELETE is
+-- rejected outright by the sandboxes_delete_rejected trigger below, so
+-- nothing can ever cascade-erase the history through this relationship.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS sandbox_transitions (
     sandbox_transition_id uuid       PRIMARY KEY,
-    sandbox_id            uuid       NOT NULL REFERENCES sandboxes(sandbox_id) ON DELETE CASCADE,
+    sandbox_id            uuid       NOT NULL REFERENCES sandboxes(sandbox_id),
     idempotency_key       text       NOT NULL
                           CHECK (length(idempotency_key) >= 1 AND length(idempotency_key) <= 200),
     from_status           text       NOT NULL
@@ -444,6 +455,33 @@ DROP TRIGGER IF EXISTS sandboxes_release_gate_trigger ON sandboxes;
 CREATE TRIGGER sandboxes_release_gate_trigger
     BEFORE UPDATE ON sandboxes
     FOR EACH ROW EXECUTE FUNCTION sandboxes_release_gate();
+
+-- ---------------------------------------------------------------------------
+-- THE SANDBOX ROW DELETE REJECTION (PR #21 review finding #5452651719):
+-- a Sandbox row is a durable lifecycle record — its end-of-life is the
+-- RELEASED state, NEVER row erasure. A direct SQL DELETE of a sandbox is
+-- rejected at the database level, unconditionally:
+--
+--     DELETE sandbox → REJECT → sandbox remains, sandbox_transitions remains
+--
+-- Defense in depth with the non-destructive ledger FK above (which alone
+-- would only guard sandboxes that already have recorded history): the
+-- trigger rejects the DELETE of ANY sandbox row — including a freshly
+-- provisioned REQUESTED row whose append-only ledger is still empty — so
+-- the lifecycle history can never be erased by deleting its subject, not
+-- even before the first transition lands.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION sandboxes_delete_rejected() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'sandbox % rows are never deleted; the lifecycle ends in the released state (append-only history)',
+        OLD.sandbox_id;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS sandboxes_delete_rejected_trigger ON sandboxes;
+CREATE TRIGGER sandboxes_delete_rejected_trigger
+    BEFORE DELETE ON sandboxes
+    FOR EACH ROW EXECUTE FUNCTION sandboxes_delete_rejected();
 
 -- ---------------------------------------------------------------------------
 -- Lease upgrades (execution_sandbox_leases, migration 011 — appended here;

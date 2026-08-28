@@ -52,7 +52,12 @@
  *   - database backstops: the frozen machine, identity immutability, the
  *     scope-chain fence, the live-environment fence, the from_status
  *     history-consistency backstop, the append-only ledger, the release
- *     gate and the lease-contract trigger all reject direct SQL;
+ *     gate and the lease-contract trigger all reject direct SQL — as does
+ *     the SANDBOX ROW DELETE REJECTION (PR #21 finding #5452651719):
+ *     DELETE sandbox → REJECT → sandbox remains, sandbox_transitions
+ *     remains (unconditionally — even for a freshly provisioned REQUESTED
+ *     row whose ledger is still empty, the case the pre-fix cascade
+ *     silently erased);
  *   - cross-tenant posture: uniform 404s for foreign/unknown sandbox ids;
  *     operators read but never mutate (403); every mutation lands in the
  *     append-only audit trail and replays converge.
@@ -1531,6 +1536,80 @@ test('database backstops: frozen machine, identity immutability, scope chain, hi
       [sandboxId],
     );
     assert.equal(toReleasing.rowCount, 1, 'the teardown entry is legal once no lease controls the sandbox');
+  } finally {
+    await db.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The ledger-preserving delete policy (PR #21 review finding #5452651719)
+// ---------------------------------------------------------------------------
+
+test('database backstop: a direct SQL DELETE of a sandbox is rejected and the lifecycle history remains (PR #21 finding #5452651719)', async () => {
+  // Case A — THE DEFECT PROBE (the silent-erasure case the pre-fix ON
+  // DELETE CASCADE enabled): a freshly provisioned REQUESTED sandbox has an
+  // EMPTY ledger (the frozen machine has no entering edge for 'requested'),
+  // so nothing fired the append-only trigger when the cascade deleted the
+  // row — the sandbox vanished with no trace. The DB-level rejection must
+  // hold even BEFORE the first transition lands.
+  const provision = await provisionSandbox(
+    { runtimeClass: 'ephemeral-sandbox', idempotencyKey: 'delete-reject-requested' },
+    owner.token,
+  );
+  assert.equal(provision.status, 201, JSON.stringify(provision.body));
+  const requestedId = (provision.body['sandbox'] as Record<string, unknown>)['sandboxId'] as string;
+
+  // Case B — the Architect's exact flow: a sandbox WITH recorded history
+  // (requested → preparing → ready).
+  const readyId = await provisionReadySandbox(
+    { runtimeClass: 'ephemeral-sandbox', idempotencyKey: 'delete-reject-ready' },
+    'delete-reject-ready',
+  );
+
+  const db = new PgDb(stack!.env.databaseUrl, 2);
+  try {
+    // Case A: DELETE sandbox → REJECT. On the pre-fix head (28f11b7) this
+    // DELETE SUCCEEDED and silently erased the row — the deterministic
+    // defect the regression must catch.
+    await assert.rejects(
+      db.query(`DELETE FROM sandboxes WHERE sandbox_id = $1`, [requestedId]),
+      /rows are never deleted/,
+    );
+    const requestedRow = await db.query<{ status: string }>(
+      `SELECT status FROM sandboxes WHERE sandbox_id = $1`,
+      [requestedId],
+    );
+    assert.equal(requestedRow.rowCount, 1, 'the sandbox remains');
+    assert.equal(requestedRow.rows[0]!.status, 'requested');
+
+    // Case B: DELETE sandbox → REJECT → sandbox remains AND
+    // sandbox_transitions remains (the append-only history is never erased
+    // by deleting its subject).
+    const historyBefore = await db.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM sandbox_transitions WHERE sandbox_id = $1`,
+      [readyId],
+    );
+    const historyCount = Number(historyBefore.rows[0]!.count);
+    assert.ok(historyCount >= 2, 'the prepared sandbox carries its provisioning history');
+    await assert.rejects(
+      db.query(`DELETE FROM sandboxes WHERE sandbox_id = $1`, [readyId]),
+      /rows are never deleted/,
+    );
+    const readyRow = await db.query<{ status: string }>(
+      `SELECT status FROM sandboxes WHERE sandbox_id = $1`,
+      [readyId],
+    );
+    assert.equal(readyRow.rowCount, 1, 'the sandbox remains');
+    assert.equal(readyRow.rows[0]!.status, 'ready');
+    const historyAfter = await db.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM sandbox_transitions WHERE sandbox_id = $1`,
+      [readyId],
+    );
+    assert.equal(
+      Number(historyAfter.rows[0]!.count),
+      historyCount,
+      'sandbox_transitions remains (the lifecycle history is not erased)',
+    );
   } finally {
     await db.close();
   }
