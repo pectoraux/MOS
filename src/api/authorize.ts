@@ -2,7 +2,8 @@
  * Server-side authorization helpers for identity routes (MKT-002), Client
  * tenancy routes (MKT-003), Workspace boundary routes (MKT-004), Goal
  * domain routes (MKT-006), credential-reference routes (MKT-005), Playbook
- * domain routes (MKT-007) and Workflow definition routes (MKT-008).
+ * domain routes (MKT-007), Workflow definition routes (MKT-008) and
+ * Execution lifecycle routes (MKT-010).
  *
  * Every check resolves the caller's authorization context FRESH from durable
  * state (users + agency memberships in PostgreSQL) — headers, body fields or
@@ -30,6 +31,7 @@ import type { Principal } from '../platform/http/auth/contract.ts';
 import type { AgencyRoleKey, AuthorizationContext } from '../modules/agencies/public.ts';
 import type { ClientOwnerContext } from '../modules/clients/public.ts';
 import type { CredentialRecord } from '../modules/credentials/public.ts';
+import type { ExecutionOwnerContext } from '../modules/executions/public.ts';
 import type { GoalOwnerContext } from '../modules/goals/public.ts';
 import type { PlaybookOwnerContext } from '../modules/playbooks/public.ts';
 import type { WorkflowOwnerContext } from '../modules/workflows/public.ts';
@@ -405,6 +407,60 @@ export async function requireWorkflowAccess(
   }
   if (membership.membershipStatus !== 'active') {
     throw new ForbiddenError('Active membership in the workflow agency required');
+  }
+  if (roles !== undefined && !roles.includes(membership.role)) {
+    throw new ForbiddenError('This operation requires a different agency role');
+  }
+  return ownership;
+}
+
+/**
+ * Execution-lifecycle access check (MKT-010).
+ *
+ * Step 1 loads the canonical Execution owner context (execution → its
+ * Workspace → the owning Client → the owning Agency, all from durable
+ * state): an unknown identifier OR a tombstoned boundary is a uniform 404
+ * (indistinguishable). Step 2 authorizes the caller against the agency that
+ * OWNS the execution's Workspace — the SAME durable membership authority as
+ * every other scoped check (no second authorization authority):
+ *
+ *   - service principal and platform administrators pass;
+ *   - a caller with NO membership in the owning agency gets the SAME 404 as
+ *     for an unknown execution — a foreign execution id is not a
+ *     traversal/existence oracle (cross-tenant posture);
+ *   - a suspended membership or disabled identity never authorizes (403);
+ *   - `roles` optionally restricts to specific agency roles (403 otherwise).
+ */
+export async function requireExecutionAccess(
+  modules: ApplicationModules,
+  principal: Principal,
+  executionId: string,
+  roles?: ReadonlyArray<AgencyRoleKey>,
+): Promise<ExecutionOwnerContext> {
+  const ownership = await modules.executions.resolveExecutionOwnership(executionId);
+  if (ownership === null) {
+    throw new NotFoundError('execution', executionId);
+  }
+
+  if (principal.kind === 'service') return ownership;
+
+  const context = await resolveContext(modules, principal);
+  if (context === null || context.principal.status !== 'active') {
+    throw new ForbiddenError('Active user identity required');
+  }
+  if (context.platformRoles.includes('platform_administrator')) return ownership;
+
+  const membership = context.memberships.find(
+    (entry) => entry.agencyId === ownership.agency.agencyId,
+  );
+  if (membership === undefined) {
+    // Hard boundary: not a member of the OWNING agency → indistinguishable
+    // from an unknown Execution (uniform 404, no cross-tenant oracle;
+    // rejection BEFORE any dependent traversal).
+    throw new NotFoundError('execution', executionId);
+  }
+  if (membership.membershipStatus !== 'active') {
+    throw new ForbiddenError('Active membership in the execution agency required');
   }
   if (roles !== undefined && !roles.includes(membership.role)) {
     throw new ForbiddenError('This operation requires a different agency role');

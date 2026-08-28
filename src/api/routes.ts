@@ -2,7 +2,9 @@
  * API router assembly (MKT-001 platform + MKT-002 identity routes + MKT-003
  * Client tenancy routes + MKT-004 Workspace boundary routes + MKT-005
  * credential-reference routes + MKT-006 Goal domain routes + MKT-007
- * Playbook domain routes + MKT-008 Workflow definition routes).
+ * Playbook domain routes + MKT-008 Workflow definition routes + MKT-009
+ * Workflow instance state machine routes + MKT-010 Execution lifecycle
+ * routes).
  *
  * One Router instance serves every module surface; each register* function
  * owns its /api/<module>/* prefix. The composition root builds the services
@@ -26,6 +28,7 @@ import { registerCredentialsRoutes } from './credentials-routes.ts';
 import { registerGoalsRoutes } from './goals-routes.ts';
 import { registerPlaybooksRoutes } from './playbooks-routes.ts';
 import { registerWorkflowsRoutes } from './workflows-routes.ts';
+import { registerExecutionsRoutes } from './executions-routes.ts';
 
 export function buildApiRouter(services: AppServices, modules: ApplicationModules): Router {
   const router = new Router();
@@ -39,5 +42,6 @@ export function buildApiRouter(services: AppServices, modules: ApplicationModule
   registerGoalsRoutes(router, services, modules);
   registerPlaybooksRoutes(router, services, modules);
   registerWorkflowsRoutes(router, services, modules);
+  registerExecutionsRoutes(router, services, modules);
   return router;
 }
