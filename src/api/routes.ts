@@ -4,7 +4,8 @@
  * credential-reference routes + MKT-006 Goal domain routes + MKT-007
  * Playbook domain routes + MKT-008 Workflow definition routes + MKT-009
  * Workflow instance state machine routes + MKT-010 Execution lifecycle
- * routes + MKT-012 Sandbox lifecycle routes).
+ * routes + MKT-012 Sandbox lifecycle routes + MKT-013 Evidence/provenance
+ * routes).
  *
  * One Router instance serves every module surface; each register* function
  * owns its /api/<module>/* prefix. The composition root builds the services
@@ -30,6 +31,7 @@ import { registerPlaybooksRoutes } from './playbooks-routes.ts';
 import { registerWorkflowsRoutes } from './workflows-routes.ts';
 import { registerExecutionsRoutes } from './executions-routes.ts';
 import { registerSandboxRoutes } from './sandbox-routes.ts';
+import { registerEvidenceRoutes } from './evidence-routes.ts';
 
 export function buildApiRouter(services: AppServices, modules: ApplicationModules): Router {
   const router = new Router();
@@ -45,5 +47,6 @@ export function buildApiRouter(services: AppServices, modules: ApplicationModule
   registerWorkflowsRoutes(router, services, modules);
   registerExecutionsRoutes(router, services, modules);
   registerSandboxRoutes(router, services, modules);
+  registerEvidenceRoutes(router, services, modules);
   return router;
 }

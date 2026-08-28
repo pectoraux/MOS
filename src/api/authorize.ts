@@ -3,7 +3,8 @@
  * tenancy routes (MKT-003), Workspace boundary routes (MKT-004), Goal
  * domain routes (MKT-006), credential-reference routes (MKT-005), Playbook
  * domain routes (MKT-007), Workflow definition routes (MKT-008), Execution
- * lifecycle routes (MKT-010) and Sandbox lifecycle routes (MKT-012).
+ * lifecycle routes (MKT-010), Sandbox lifecycle routes (MKT-012) and
+ * Evidence/provenance routes (MKT-013).
  *
  * Every check resolves the caller's authorization context FRESH from durable
  * state (users + agency memberships in PostgreSQL) — headers, body fields or
@@ -31,6 +32,7 @@ import type { Principal } from '../platform/http/auth/contract.ts';
 import type { AgencyRoleKey, AuthorizationContext } from '../modules/agencies/public.ts';
 import type { ClientOwnerContext } from '../modules/clients/public.ts';
 import type { CredentialRecord } from '../modules/credentials/public.ts';
+import type { EvidenceOwnerContext } from '../modules/evidence/public.ts';
 import type { ExecutionOwnerContext, SandboxOwnerContext } from '../modules/executions/public.ts';
 import type { GoalOwnerContext } from '../modules/goals/public.ts';
 import type { PlaybookOwnerContext } from '../modules/playbooks/public.ts';
@@ -579,4 +581,67 @@ export async function requireCredentialAccess(
     throw new ForbiddenError('This operation requires a different agency role');
   }
   return reference;
+}
+
+/**
+ * Evidence-scoped access check (MKT-013, EVID-001).
+ *
+ * Step 1 resolves the CANONICAL evidence ownership from durable state
+ * (evidence row → owning Workspace via /workspaces resolveWorkspaceOwnership
+ * → owning Client via /clients resolveClientOwnership → owning Agency)
+ * BEFORE anything else — an unknown record, a record whose workspace or
+ * client is a deleted tombstone: all resolve to a uniform 404,
+ * indistinguishable. Step 2 authorizes the caller against the agency that
+ * OWNS the evidence record's workspace, using the SAME durable membership
+ * authority as every other scoped check (no second authorization
+ * authority):
+ *
+ *   - service principal and platform administrators pass;
+ *   - a caller with NO membership in the owning agency gets the SAME 404 as
+ *     for an unknown evidence record — a foreign evidence identifier is not
+ *     a traversal/existence oracle (cross-tenant posture; rejection happens
+ *     BEFORE any dependent traversal);
+ *   - a suspended (disabled) membership or disabled identity never
+ *     authorizes (403);
+ *   - `roles` optionally restricts to specific agency roles (403 otherwise).
+ *
+ * Returns the canonical owner context the operation is scoped to. An
+ * Evidence ID is NEVER itself an authorization credential — it only selects
+ * WHICH durable ownership chain gets resolved.
+ */
+export async function requireEvidenceAccess(
+  modules: ApplicationModules,
+  principal: Principal,
+  evidenceId: string,
+  roles?: ReadonlyArray<AgencyRoleKey>,
+): Promise<EvidenceOwnerContext> {
+  const ownership = await modules.evidence.resolveEvidenceOwnership(evidenceId);
+  if (ownership === null) {
+    throw new NotFoundError('evidence', evidenceId);
+  }
+
+  if (principal.kind === 'service') return ownership;
+
+  const context = await resolveContext(modules, principal);
+  if (context === null || context.principal.status !== 'active') {
+    throw new ForbiddenError('Active user identity required');
+  }
+  if (context.platformRoles.includes('platform_administrator')) return ownership;
+
+  const membership = context.memberships.find(
+    (entry) => entry.agencyId === ownership.workspaceOwnership.clientOwnership.client.agencyId,
+  );
+  if (membership === undefined) {
+    // Hard boundary: not a member of the agency owning the evidence
+    // record's WORKSPACE → indistinguishable from an unknown evidence
+    // record (uniform 404, no cross-tenant oracle).
+    throw new NotFoundError('evidence', evidenceId);
+  }
+  if (membership.membershipStatus !== 'active') {
+    throw new ForbiddenError('Active membership in the evidence workspace agency required');
+  }
+  if (roles !== undefined && !roles.includes(membership.role)) {
+    throw new ForbiddenError('This operation requires a different agency role');
+  }
+  return ownership;
 }

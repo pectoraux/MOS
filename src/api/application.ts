@@ -20,6 +20,8 @@
  * implementation-contract §5).
  *
  * MKT-010 additions: /executions (normalized Execution model, EXEC-001).
+ *
+ * MKT-013 additions: /evidence (Evidence and provenance, EVID-001).
  */
 
 import type { AgenciesModuleApi } from '../modules/agencies/public.ts';
@@ -27,6 +29,7 @@ import type { AuditModuleApi } from '../modules/audit/public.ts';
 import type { AuthModuleApi } from '../modules/auth/public.ts';
 import type { ClientsModuleApi } from '../modules/clients/public.ts';
 import type { CredentialsModuleApi } from '../modules/credentials/public.ts';
+import type { EvidenceModuleApi } from '../modules/evidence/public.ts';
 import type { ExecutionsModuleApi } from '../modules/executions/public.ts';
 import type { GoalsModuleApi } from '../modules/goals/public.ts';
 import type { PlaybooksModuleApi } from '../modules/playbooks/public.ts';
@@ -46,4 +49,5 @@ export interface ApplicationModules {
   readonly playbooks: PlaybooksModuleApi;
   readonly workflows: WorkflowsModuleApi;
   readonly executions: ExecutionsModuleApi;
+  readonly evidence: EvidenceModuleApi;
 }
