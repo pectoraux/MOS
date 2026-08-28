@@ -8,6 +8,23 @@
  * Definition — the graph artifact a Playbook Version's strategy is turned
  * INTO on the way to something deployable (the dependency graph:
  * Client/Workspace → Goal → Playbook Version → Workflow Definition → …).
+ *
+ * MKT-009 extends the SAME module with the INSTANCE sub-authority
+ * (implementation-contract §5 "Workflow instance state machine";
+ * state-machines.md "Workflow Instance"; work-items.md MKT-009 "implement
+ * one deterministic lifecycle authority for Workflow instances"): the
+ * Workflow INSTANCE — an identity that pins ONE immutable Workflow
+ * Definition through its EXPLICIT workflow_definition_id reference (never a
+ * floating "latest") and carries the frozen §5 lifecycle
+ * (DRAFT → READY → RUNNING with PAUSED/BLOCKED returns and the three
+ * terminal states SUCCEEDED/FAILED/CANCELLED). Every transition is guarded
+ * by the frozen transition table, serialized by the instance row lock,
+ * fenced by the version CAS token, recorded as append-only history and made
+ * idempotent by the (instance, idempotency_key) fence — duplicate transition
+ * requests converge to the recorded transition instead of re-applying
+ * (§5: "transitions use CAS/version checks", "terminal states are
+ * immutable", "duplicate transition requests are idempotent").
+ *
  * This module owns:
  *
  *   - Workflow identity and the Workspace-scoped ownership relation
@@ -53,23 +70,31 @@
  *     an authorization credential.
  *
  * A Workflow Definition is NOT an execution and NOT a runtime instance
- * (architecture.md §10/§11): MKT-008 introduces NO workflow-instance state
+ * (architecture.md §10/§11): MKT-008 introduced NO workflow-instance state
  * machine, NO run/task/execution lifecycle, NO retry orchestration and NO
- * deployment authority — the Workflow INSTANCE state machine (DRAFT → READY
- * → RUNNING → …) is MKT-009's extension of this same module, Executions are
- * the /executions authority (MKT-010) and deployment binding is the
- * /deployments authority (MKT-040). The policy blocks persisted here
- * (retry defaults, concurrency limits, timeouts, compensation declarations)
- * are declarative data the future runtime interprets — nothing here
- * executes anything. Agency membership/role authorization remains the
- * /agencies authority (MKT-002); this module composes /workspaces +
- * /playbooks canonical ownership with that authority — no second tenant,
- * permission, execution or deployment authority is introduced.
+ * deployment authority. MKT-009 adds the Workflow INSTANCE state machine to
+ * this same module — instances own lifecycle state ONLY; they never execute
+ * anything: there is no node-instance bookkeeping, no task production, no
+ * input consumption, no output recording and no retry orchestration here
+ * (Executions are the /executions authority, MKT-010; deployment binding is
+ * the /deployments authority, MKT-040). The policy blocks persisted with
+ * definitions (retry defaults, concurrency limits, timeouts, compensation
+ * declarations) remain declarative data a future runtime interprets.
+ * Agency membership/role authorization remains the /agencies authority
+ * (MKT-002); this module composes /workspaces + /playbooks canonical
+ * ownership with that authority — no second tenant, permission, execution
+ * or deployment authority is introduced.
  *
  * Cross-module access may only target this public entry (public.ts) —
  * dependency matrix: /workflows ──→ /workspaces, /goals, /playbooks,
- * /executions, /policies, /audit (MKT-008 uses exactly /workspaces +
+ * /executions, /policies, /audit (MKT-008/009 use exactly /workspaces +
  * /playbooks; the runtime authorities arrive with later Work Items).
+ * Only this module's public transition surface may mutate workflow-instance
+ * state (§5: "only /workflows may mutate workflow-instance state") — the
+ * transitionWorkflowInstance operation IS the authorized workflow command
+ * port future /executions and /extensions callers must target; no AI,
+ * human, extension or worker output can write instance state directly
+ * (WF-AC-04 instance/state portion).
  */
 
 import type { Clock } from '../../platform/clock/clock.ts';
@@ -123,6 +148,83 @@ export function isLegalWorkflowDefinitionTransition(
   to: WorkflowDefinitionStatus,
 ): boolean {
   return WORKFLOW_DEFINITION_TRANSITIONS[from].includes(to);
+}
+
+/**
+ * Workflow INSTANCE lifecycle — the FROZEN §5 state machine
+ * (implementation-contract §5 "Workflow instance state machine";
+ * state-machines.md "Workflow Instance"):
+ *
+ *   DRAFT → READY → RUNNING
+ *                    ├→ PAUSED → RUNNING
+ *                    ├→ BLOCKED → RUNNING
+ *                    ├→ SUCCEEDED
+ *                    ├→ FAILED
+ *                    └→ CANCELLED
+ *
+ * Exactly nine legal edges, no self-loops, no skip-edges, no back-edges:
+ * `ready` is reachable only from `draft`; `running` only from `ready`,
+ * `paused` or `blocked`; `paused`/`blocked` only from `running` (with the
+ * matching resumption back to `running`); the three terminal states
+ * (`succeeded`, `failed`, `cancelled`) are reachable ONLY from `running`
+ * and are IMMUTABLE — no outgoing transitions at all ("terminal states are
+ * immutable", §5). An instance is a LIFECYCLE IDENTITY ONLY: this machine
+ * records state, it never executes nodes, produces Tasks or interprets the
+ * definition's policy blocks (that is /executions, MKT-010+).
+ */
+export type WorkflowInstanceStatus =
+  | 'draft'
+  | 'ready'
+  | 'running'
+  | 'paused'
+  | 'blocked'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled';
+
+export const WORKFLOW_INSTANCE_STATUSES: readonly WorkflowInstanceStatus[] = [
+  'draft',
+  'ready',
+  'running',
+  'paused',
+  'blocked',
+  'succeeded',
+  'failed',
+  'cancelled',
+];
+
+/** The terminal §5 states — immutable once entered, no outgoing edges. */
+export const WORKFLOW_INSTANCE_TERMINAL_STATUSES: readonly WorkflowInstanceStatus[] = [
+  'succeeded',
+  'failed',
+  'cancelled',
+];
+
+/** The FROZEN §5 transition table (exhaustive; unit-tested byte for byte). */
+export const WORKFLOW_INSTANCE_TRANSITIONS: Readonly<
+  Record<WorkflowInstanceStatus, readonly WorkflowInstanceStatus[]>
+> = {
+  draft: ['ready'],
+  ready: ['running'],
+  running: ['paused', 'blocked', 'succeeded', 'failed', 'cancelled'],
+  paused: ['running'],
+  blocked: ['running'],
+  succeeded: [],
+  failed: [],
+  cancelled: [],
+};
+
+/** Transition-guard predicate: true exactly when (from → to) is a frozen §5 edge. */
+export function isLegalWorkflowInstanceTransition(
+  from: WorkflowInstanceStatus,
+  to: WorkflowInstanceStatus,
+): boolean {
+  return WORKFLOW_INSTANCE_TRANSITIONS[from].includes(to);
+}
+
+/** Terminal-state predicate: succeeded/failed/cancelled and nothing else. */
+export function isTerminalWorkflowInstanceStatus(status: WorkflowInstanceStatus): boolean {
+  return WORKFLOW_INSTANCE_TERMINAL_STATUSES.includes(status);
 }
 
 /**
@@ -423,6 +525,69 @@ export interface WorkflowDefinitionRecord {
 }
 
 /**
+ * Immutable storage shape of one persisted Workflow INSTANCE — the §5
+ * lifecycle identity that pins ONE immutable definition version. The pinned
+ * `workflowDefinitionId` is the EXPLICIT version reference (MKT-008's
+ * contract: no floating "latest" resolution anywhere); it is immutable for
+ * the instance's whole life, and the definition's own immutability
+ * guarantees the pinned content never changes under the instance (an
+ * ACTIVE definition is content-frozen and the active → retired retirement
+ * preserves content byte for byte). Scope columns are server-derived from
+ * the canonical Workflow owner at creation (DB-backstopped on both
+ * boundary hops); `version` is the CAS token every transition must present.
+ */
+export interface WorkflowInstanceRecord {
+  readonly workflowInstanceId: string;
+  readonly workflowId: string;
+  /** The EXPLICIT pinned definition version — immutable once set, never floating. */
+  readonly workflowDefinitionId: string;
+  /** Server-derived from the canonical Workflow owner at creation. */
+  readonly workspaceId: string;
+  /** Server-derived from the canonical Workspace owner at creation. */
+  readonly clientId: string;
+  /** Server-derived from the canonical Client owner at creation. */
+  readonly agencyId: string;
+  readonly status: WorkflowInstanceStatus;
+  readonly createdBy: string | null;
+  readonly version: number;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+/**
+ * One APPLIED instance transition — append-only history (the table rejects
+ * UPDATE and DELETE at the database level). The `idempotencyKey` is the
+ * caller's logical request key fenced UNIQUE per instance: a replayed
+ * duplicate transition request converges to this recorded row instead of
+ * re-applying (§5: "duplicate transition requests are idempotent").
+ */
+export interface WorkflowInstanceTransitionRecord {
+  readonly transitionId: string;
+  readonly workflowInstanceId: string;
+  readonly idempotencyKey: string;
+  readonly fromStatus: WorkflowInstanceStatus;
+  readonly toStatus: WorkflowInstanceStatus;
+  readonly reason: string;
+  readonly createdBy: string | null;
+  readonly createdAt: string;
+}
+
+/**
+ * The outcome of one transition request: the instance record AFTER the
+ * operation, the recorded transition row, and whether this request was a
+ * REPLAY (a duplicate that converged to the already-recorded transition —
+ * no state change, no new history row, no version bump). On replay the
+ * `instance` is the CURRENT durable record (the instance may legitimately
+ * have moved on since the recorded transition); the `transition` is the
+ * original recorded outcome the duplicate converged to.
+ */
+export interface WorkflowInstanceTransitionOutcome {
+  readonly instance: WorkflowInstanceRecord;
+  readonly transition: WorkflowInstanceTransitionRecord;
+  readonly replayed: boolean;
+}
+
+/**
  * The CANONICAL WORKFLOW OWNER CONTEXT: the single server-side resolution
  * of WHICH tenant owns the Workflow — the owning Workspace, the Client
  * that owns it and the Agency that owns that Client, all derived from
@@ -575,6 +740,68 @@ export interface WorkflowsModuleApi {
     readonly status: WorkflowDefinitionStatus;
     readonly expectedVersion: number;
   }): Promise<WorkflowDefinitionRecord>;
+  /**
+   * Creates a Workflow INSTANCE of an ACTIVE Workflow Definition — the §5
+   * lifecycle identity, born DRAFT. The pinned definition is resolved by
+   * its EXPLICIT workflowDefinitionId (no floating "latest"): an unknown
+   * definition, a definition of a DIFFERENT workflow, or a definition that
+   * is not ACTIVE (draft/review are still CAS-editable; retired records
+   * ended versions) is rejected — an instance can only rest on a
+   * content-frozen version. Workspace/Client/Agency ownership is resolved
+   * through the canonical Workflow owner chain and is SERVER-DERIVED.
+   * Policy: instantiation is NEW use — requires ACTIVE Workspace, Client
+   * and Agency boundaries. Unknown/tombstoned workflow → 404.
+   */
+  createWorkflowInstance(input: {
+    readonly workflowId: string;
+    readonly workflowDefinitionId: string;
+    readonly actorId: string | null;
+  }): Promise<WorkflowInstanceRecord>;
+  /** Raw instance record by id — module/route internal reads. */
+  getWorkflowInstance(instanceId: string): Promise<WorkflowInstanceRecord | null>;
+  /** The instances of one Workflow in EVERY lifecycle state (terminal history stays visible), oldest first. */
+  listWorkflowInstances(workflowId: string): Promise<readonly WorkflowInstanceRecord[]>;
+  /**
+   * The append-only applied-transition history of one instance, oldest
+   * first — the authoritative record of every state decision (and the
+   * idempotency ledger: one row per applied request key).
+   */
+  getWorkflowInstanceTransitions(
+    instanceId: string,
+  ): Promise<readonly WorkflowInstanceTransitionRecord[]>;
+  /**
+   * THE §5 TRANSITION OPERATION — the single authorized mutation port for
+   * workflow-instance state ("only /workflows may mutate workflow-instance
+   * state"). Runs as one row-locked CAS transaction:
+   *
+   *   1. IDEMPOTENCE FIRST: a request whose (instance, idempotencyKey)
+   *      already has a recorded transition CONVERGES to that outcome —
+   *      replayed=true, no state change, no new history row, no version
+   *      bump, and the CAS token is deliberately NOT re-checked (that is
+   *      what makes duplicate delivery converge, §5 "duplicate transition
+   *      requests are idempotent"). Reusing a key with a DIFFERENT target
+   *      state is a ConflictError — a key identifies one logical command.
+   *   2. CAS: the presented expectedVersion must equal the current row
+   *      version (ConflictError otherwise).
+   *   3. GUARD: (current → to) must be a frozen §5 edge (ConflictError
+   *      otherwise; terminal states reject everything).
+   *   4. BOUNDARY POLICY: transitions INTO running (ready → running,
+   *      paused → running, blocked → running) are NEW USE — they require
+   *      ACTIVE Workspace/Client/Agency boundaries. Editorial staging
+   *      (draft → ready), control recording (running → paused/blocked) and
+   *      terminal recording (succeeded/failed/cancelled) stay available
+   *      regardless of boundary state — history keeps being recordable.
+   *
+   * The applied transition is recorded append-only with its request key.
+   */
+  transitionWorkflowInstance(input: {
+    readonly instanceId: string;
+    readonly to: WorkflowInstanceStatus;
+    readonly expectedVersion: number;
+    readonly idempotencyKey: string;
+    readonly reason: string | null;
+    readonly actorId: string | null;
+  }): Promise<WorkflowInstanceTransitionOutcome>;
 }
 
 export interface WorkflowsModuleDeps {

@@ -1,5 +1,6 @@
 /**
- * /workflows API routes (MKT-008 — the Workflow DEFINITION sub-authority).
+ * /workflows API routes (MKT-008 — the Workflow DEFINITION sub-authority;
+ * MKT-009 — the Workflow INSTANCE sub-authority).
  *
  *   POST   /api/workspaces/:workspaceId/workflows                        create Workflow (owner|admin|platform admin)
  *   GET    /api/workspaces/:workspaceId/workflows                        list the Workspace's workflows (any active member)
@@ -11,17 +12,27 @@
  *   GET    /api/workflows/:workflowId/definitions/:definitionId          read the EXPLICIT version reference (any active member)
  *   PATCH  /api/workflows/:workflowId/definitions/:definitionId/profile  CAS content update, draft/review only (owner|admin|platform admin)
  *   PATCH  /api/workflows/:workflowId/definitions/:definitionId/status   CAS lifecycle transition (owner|admin|platform admin)
+ *   POST   /api/workflows/:workflowId/definitions/:definitionId/instances       create instance of the ACTIVE definition (owner|admin|platform admin)
+ *   GET    /api/workflows/:workflowId/instances                                list instances in ALL states (any active member)
+ *   GET    /api/workflows/:workflowId/instances/:instanceId                     read instance (any active member)
+ *   GET    /api/workflows/:workflowId/instances/:instanceId/transitions         append-only transition history (any active member)
+ *   POST   /api/workflows/:workflowId/instances/:instanceId/transitions         apply a §5 transition, idempotency-fenced CAS command (owner|admin|platform admin)
  *
  * The Workflow Definition is the typed, versioned graph artifact (WF-001)
  * a Playbook Version's strategy is turned into on the way to something
- * deployable. Every route resolves the canonical owner from durable state
- * BEFORE authorize/validate/execute (implementation-contract §2: the
- * workflow → workspace → client → agency chain), authorizes against the
- * SAME /agencies membership authority as every other scoped check (no
- * second authorization authority) and rejects every authority field
- * caller-side (identity, scope, provenance and version identity are
- * server-derived). Cross-tenant and unknown identifiers yield a UNIFORM
- * 404 (no traversal/existence oracle).
+ * deployable. The Workflow INSTANCE (MKT-009, implementation-contract §5)
+ * is the lifecycle identity that pins one ACTIVE definition through the
+ * EXPLICIT workflow_definition_id reference and carries the frozen
+ * DRAFT → READY → RUNNING → … state machine. Every route resolves the
+ * canonical owner from durable state BEFORE authorize/validate/execute
+ * (implementation-contract §2: the workflow → workspace → client → agency
+ * chain), authorizes against the SAME /agencies membership authority as
+ * every other scoped check (no second authorization authority) and rejects
+ * every authority field caller-side (identity, scope, provenance and
+ * version identity are server-derived). Cross-tenant and unknown
+ * identifiers yield a UNIFORM 404 (no traversal/existence oracle) — an
+ * instance id belonging to a DIFFERENT workflow is indistinguishable from
+ * an unknown one under this workflow.
  *
  * Route validation is the ENVELOPE (types, bounds, authority-field
  * rejection, playbook reference shape); the exhaustive typed-graph
@@ -30,14 +41,18 @@
  * schema mappings, explicit bounded loops) is the /workflows MODULE
  * authority and runs there on every create and content update.
  *
- * NO runtime authority is introduced here (architecture.md §10/§11):
- * these routes define and version immutable graphs only — there is no
- * instance creation, no start/pause/resume/cancel, no task dispatch and
- * no execution surface (the Workflow INSTANCE state machine is MKT-009;
- * Executions are /executions, MKT-010). The EXPLICIT version reference
- * surface (GET .../definitions/:definitionId — any lifecycle state, byte
- * for byte, forever) is the contract end future Deployment/Workflow-
- * instance authorities pin; there is no floating "latest" route.
+ * NO execution authority is introduced here (architecture.md §10/§11):
+ * these routes define and version immutable graphs, and record instance
+ * LIFECYCLE STATE only — there is no task dispatch, no node-instance
+ * bookkeeping, no run input/output surface and no execution surface
+ * (Executions are /executions, MKT-010). The INSTANCE transition route is
+ * the §5 "only /workflows may mutate workflow-instance state" command
+ * port: idempotency-fenced (duplicate requests converge to the recorded
+ * transition), CAS-guarded and transition-guarded by the module
+ * authority. The EXPLICIT version reference surface (GET
+ * .../definitions/:definitionId — any lifecycle state, byte for byte,
+ * forever) is the contract end instances pin; there is no floating
+ * "latest" route anywhere.
  */
 
 import { NotFoundError } from '../platform/errors/errors.ts';
@@ -68,6 +83,10 @@ import type {
   WorkflowDefinitionRecord,
   WorkflowDefinitionStatus,
   WorkflowGraph,
+  WorkflowInstanceRecord,
+  WorkflowInstanceStatus,
+  WorkflowInstanceTransitionOutcome,
+  WorkflowInstanceTransitionRecord,
   WorkflowOwnerContext,
   WorkflowRecord,
   WorkflowRetryPolicyDefaults,
@@ -77,6 +96,13 @@ import type {
 
 const WORKFLOW_DEFINITION_STATUS_PATTERN = /^(draft|review|active|retired)$/;
 const WORKFLOW_DEFINITION_ID_MAX_LENGTH = 64;
+
+/**
+ * Valid §5 transition TARGETS (never 'draft' — nothing transitions INTO
+ * draft; the instance is born there).
+ */
+const WORKFLOW_INSTANCE_TARGET_PATTERN = /^(ready|running|paused|blocked|succeeded|failed|cancelled)$/;
+const WORKFLOW_INSTANCE_IDEMPOTENCY_KEY_MAX_LENGTH = 200;
 
 /** Fields that are always server-derived on CREATE (authority fields). */
 const WORKFLOW_CREATE_AUTHORITY_FIELDS = [
@@ -120,6 +146,45 @@ const WORKFLOW_DEFINITION_CAS_AUTHORITY_FIELDS = [
   'workflowDefinitionId',
   'workflowId',
   'versionNumber',
+  'createdBy',
+  'createdAt',
+  'updatedAt',
+] as const;
+
+/** Fields that are always server-derived on instance CREATE (authority fields). */
+const WORKFLOW_INSTANCE_CREATE_AUTHORITY_FIELDS = [
+  'workflowInstanceId',
+  'workflowId',
+  'workflowDefinitionId',
+  'workspaceId',
+  'clientId',
+  'agencyId',
+  'status',
+  'version',
+  'createdBy',
+  'createdAt',
+  'updatedAt',
+] as const;
+
+/**
+ * The transition command envelope: `to` is the target state, `version` the
+ * CAS token, `idempotencyKey` the logical command key (§5 "duplicate
+ * transition requests are idempotent") and `reason` optional bounded
+ * evidence. Every instance authority field is rejected caller-side — the
+ * current status is server-derived state, never an input.
+ */
+const WORKFLOW_INSTANCE_TRANSITION_AUTHORITY_FIELDS = [
+  'workflowInstanceId',
+  'workflowId',
+  'workflowDefinitionId',
+  'workspaceId',
+  'clientId',
+  'agencyId',
+  'status',
+  'currentStatus',
+  'fromStatus',
+  'transitionId',
+  'replayed',
   'createdBy',
   'createdAt',
   'updatedAt',
@@ -293,6 +358,47 @@ function serializeWorkflowOwnerContext(ownership: WorkflowOwnerContext): Record<
       status: ownership.agency.status,
     },
     resolvedAt: ownership.resolvedAt,
+  };
+}
+
+function serializeWorkflowInstance(instance: WorkflowInstanceRecord): Record<string, unknown> {
+  return {
+    workflowInstanceId: instance.workflowInstanceId,
+    workflowId: instance.workflowId,
+    workflowDefinitionId: instance.workflowDefinitionId,
+    workspaceId: instance.workspaceId,
+    clientId: instance.clientId,
+    agencyId: instance.agencyId,
+    status: instance.status,
+    version: instance.version,
+    ...(instance.createdBy === null ? {} : { createdBy: instance.createdBy }),
+    createdAt: instance.createdAt,
+    updatedAt: instance.updatedAt,
+  };
+}
+
+function serializeWorkflowInstanceTransition(
+  transition: WorkflowInstanceTransitionRecord,
+): Record<string, unknown> {
+  return {
+    transitionId: transition.transitionId,
+    workflowInstanceId: transition.workflowInstanceId,
+    idempotencyKey: transition.idempotencyKey,
+    fromStatus: transition.fromStatus,
+    toStatus: transition.toStatus,
+    ...(transition.reason === '' ? {} : { reason: transition.reason }),
+    ...(transition.createdBy === null ? {} : { createdBy: transition.createdBy }),
+    createdAt: transition.createdAt,
+  };
+}
+
+function serializeWorkflowInstanceTransitionOutcome(
+  outcome: WorkflowInstanceTransitionOutcome,
+): Record<string, unknown> {
+  return {
+    instance: serializeWorkflowInstance(outcome.instance),
+    transition: serializeWorkflowInstanceTransition(outcome.transition),
+    replayed: outcome.replayed,
   };
 }
 
@@ -792,6 +898,239 @@ export function registerWorkflowsRoutes(
         });
       },
       respond: (ctx) => jsonResponse(200, serializeWorkflowDefinition(ctx.result)),
+    }),
+  );
+
+  // -------------------------------------------------------------------------
+  // POST /api/workflows/:workflowId/definitions/:definitionId/instances —
+  // create a Workflow INSTANCE of this ACTIVE definition. The instance is
+  // born DRAFT and pins EXACTLY this definition version (the explicit
+  // reference; there is no floating "latest"). The definition id is part of
+  // the PATH: a definition belonging to a DIFFERENT workflow is
+  // indistinguishable from an unknown one (uniform 404 under this
+  // workflow). Body is empty — every field of the instance (identity,
+  // scope, status, version, provenance) is server-derived.
+  // -------------------------------------------------------------------------
+  router.add(
+    'POST',
+    '/api/workflows/:workflowId/definitions/:definitionId/instances',
+    defineMutationRoute<{ workflowId: string; definitionId: string }, WorkflowInstanceRecord>({
+      authenticator: services.auth,
+      resolveOwner: async (_ctx, params) => workflowOwner(params.workflowId),
+      authorize: async (ctx) => {
+        await requireWorkflowAccess(modules, ctx.principal, ctx.params.workflowId, [
+          'agency_owner',
+          'agency_admin',
+        ]);
+      },
+      validate: (ctx) =>
+        validateObject<Record<string, never>>(ctx.request.body, {
+          forbiddenKeys: WORKFLOW_INSTANCE_CREATE_AUTHORITY_FIELDS,
+          fields: {},
+        }),
+      execute: async (ctx) => {
+        return modules.workflows.createWorkflowInstance({
+          workflowId: ctx.params.workflowId,
+          workflowDefinitionId: ctx.params.definitionId,
+          actorId: ctx.principal.kind === 'user' ? ctx.principal.userId : null,
+        });
+      },
+      emit: async (ctx) => {
+        logger.info('workflows.instance.created', undefined, {
+          workflow_id: ctx.result.workflowId,
+          workflow_definition_id: ctx.result.workflowDefinitionId,
+          workflow_instance_id: ctx.result.workflowInstanceId,
+          status: ctx.result.status,
+          correlation_id: currentCorrelation().correlationId,
+        });
+        await recordMutationAudit(modules, ctx.principal, ctx.owner, {
+          action: 'workflows.instance.created',
+          targetType: 'workflow_instance',
+          targetId: ctx.result.workflowInstanceId,
+          afterVersion: ctx.result.version,
+          idempotencyKey: `workflows.instance.created:${ctx.result.workflowInstanceId}`,
+          details: {
+            workflowId: ctx.result.workflowId,
+            workflowDefinitionId: ctx.result.workflowDefinitionId,
+          },
+        });
+      },
+      respond: (ctx) => jsonResponse(201, serializeWorkflowInstance(ctx.result)),
+    }),
+  );
+
+  // -------------------------------------------------------------------------
+  // GET /api/workflows/:workflowId/instances — every instance of the
+  // Workflow in EVERY lifecycle state (terminal history is visible business
+  // record, not hidden).
+  // -------------------------------------------------------------------------
+  router.add(
+    'GET',
+    '/api/workflows/:workflowId/instances',
+    defineQueryRoute<{ workflowId: string }, readonly WorkflowInstanceRecord[]>({
+      authenticator: services.auth,
+      authorize: async (ctx) => {
+        await requireWorkflowAccess(modules, ctx.principal, ctx.params.workflowId);
+      },
+      execute: async (ctx) => {
+        return modules.workflows.listWorkflowInstances(ctx.params.workflowId);
+      },
+      respond: (ctx) =>
+        jsonResponse(200, {
+          workflowId: ctx.params.workflowId,
+          instances: ctx.result.map(serializeWorkflowInstance),
+        }),
+    }),
+  );
+
+  // -------------------------------------------------------------------------
+  // GET /api/workflows/:workflowId/instances/:instanceId — read one
+  // instance. An instance id belonging to a DIFFERENT workflow is
+  // indistinguishable from an unknown one (uniform 404 under this
+  // workflow).
+  // -------------------------------------------------------------------------
+  router.add(
+    'GET',
+    '/api/workflows/:workflowId/instances/:instanceId',
+    defineQueryRoute<{ workflowId: string; instanceId: string }, WorkflowInstanceRecord>({
+      authenticator: services.auth,
+      authorize: async (ctx) => {
+        await requireWorkflowAccess(modules, ctx.principal, ctx.params.workflowId);
+      },
+      execute: async (ctx) => {
+        const instance = await modules.workflows.getWorkflowInstance(ctx.params.instanceId);
+        if (instance === null || instance.workflowId !== ctx.params.workflowId) {
+          throw new NotFoundError('workflow instance', ctx.params.instanceId);
+        }
+        return instance;
+      },
+      respond: (ctx) => jsonResponse(200, serializeWorkflowInstance(ctx.result)),
+    }),
+  );
+
+  // -------------------------------------------------------------------------
+  // GET /api/workflows/:workflowId/instances/:instanceId/transitions — the
+  // append-only applied-transition history (the authoritative record of
+  // every state decision and the idempotency ledger). Read-only evidence.
+  // -------------------------------------------------------------------------
+  router.add(
+    'GET',
+    '/api/workflows/:workflowId/instances/:instanceId/transitions',
+    defineQueryRoute<
+      { workflowId: string; instanceId: string },
+      readonly WorkflowInstanceTransitionRecord[]
+    >({
+      authenticator: services.auth,
+      authorize: async (ctx) => {
+        await requireWorkflowAccess(modules, ctx.principal, ctx.params.workflowId);
+      },
+      execute: async (ctx) => {
+        const instance = await modules.workflows.getWorkflowInstance(ctx.params.instanceId);
+        if (instance === null || instance.workflowId !== ctx.params.workflowId) {
+          throw new NotFoundError('workflow instance', ctx.params.instanceId);
+        }
+        return modules.workflows.getWorkflowInstanceTransitions(ctx.params.instanceId);
+      },
+      respond: (ctx) =>
+        jsonResponse(200, {
+          workflowInstanceId: ctx.params.instanceId,
+          transitions: ctx.result.map(serializeWorkflowInstanceTransition),
+        }),
+    }),
+  );
+
+  // -------------------------------------------------------------------------
+  // POST /api/workflows/:workflowId/instances/:instanceId/transitions —
+  // apply ONE §5 transition: the single authorized mutation port for
+  // workflow-instance state. The command carries the target state (`to`),
+  // the CAS token (`version`) and the logical command key
+  // (`idempotencyKey`) — a duplicate request converges to the recorded
+  // transition (replayed=true; no state change, no new history row), while
+  // a key reused with a different target is a 409. Illegal transitions,
+  // stale CAS tokens and terminal-state writes are 409s from the module
+  // authority (the frozen-§5 DB trigger is the final backstop).
+  // -------------------------------------------------------------------------
+  router.add(
+    'POST',
+    '/api/workflows/:workflowId/instances/:instanceId/transitions',
+    defineMutationRoute<
+      { workflowId: string; instanceId: string },
+      WorkflowInstanceTransitionOutcome
+    >({
+      authenticator: services.auth,
+      resolveOwner: async (_ctx, params) => workflowOwner(params.workflowId),
+      authorize: async (ctx) => {
+        await requireWorkflowAccess(modules, ctx.principal, ctx.params.workflowId, [
+          'agency_owner',
+          'agency_admin',
+        ]);
+      },
+      validate: (ctx) =>
+        validateObject<{
+          to: string;
+          version: number;
+          idempotencyKey: string;
+          reason: string | undefined;
+        }>(ctx.request.body, {
+          forbiddenKeys: WORKFLOW_INSTANCE_TRANSITION_AUTHORITY_FIELDS,
+          fields: {
+            to: stringField({ pattern: WORKFLOW_INSTANCE_TARGET_PATTERN }),
+            version: intField({ min: 1, max: Number.MAX_SAFE_INTEGER }),
+            idempotencyKey: stringField({
+              minLength: 1,
+              maxLength: WORKFLOW_INSTANCE_IDEMPOTENCY_KEY_MAX_LENGTH,
+            }),
+            reason: optionalString({ maxLength: 2000 }),
+          },
+        }),
+      execute: async (ctx) => {
+        const body = ctx.validated as {
+          to: WorkflowInstanceStatus;
+          version: number;
+          idempotencyKey: string;
+          reason: string | undefined;
+        };
+        const existing = await modules.workflows.getWorkflowInstance(ctx.params.instanceId);
+        if (existing === null || existing.workflowId !== ctx.params.workflowId) {
+          throw new NotFoundError('workflow instance', ctx.params.instanceId);
+        }
+        return modules.workflows.transitionWorkflowInstance({
+          instanceId: ctx.params.instanceId,
+          to: body.to,
+          expectedVersion: body.version,
+          idempotencyKey: body.idempotencyKey,
+          reason: body.reason === undefined ? null : body.reason,
+          actorId: ctx.principal.kind === 'user' ? ctx.principal.userId : null,
+        });
+      },
+      emit: async (ctx) => {
+        logger.info('workflows.instance.transitioned', undefined, {
+          workflow_id: ctx.result.instance.workflowId,
+          workflow_instance_id: ctx.result.instance.workflowInstanceId,
+          from_status: ctx.result.transition.fromStatus,
+          to_status: ctx.result.transition.toStatus,
+          replayed: ctx.result.replayed,
+          correlation_id: currentCorrelation().correlationId,
+        });
+        await recordMutationAudit(modules, ctx.principal, ctx.owner, {
+          action: 'workflows.instance.transitioned',
+          targetType: 'workflow_instance',
+          targetId: ctx.result.instance.workflowInstanceId,
+          beforeVersion: ctx.result.instance.version - (ctx.result.replayed ? 0 : 1),
+          afterVersion: ctx.result.instance.version,
+          // Keyed by the RECORDED transition id: a replayed duplicate
+          // converges to the same single audit row (append-only trail).
+          idempotencyKey: `workflows.instance.transitioned:${ctx.result.transition.transitionId}`,
+          details: {
+            fromStatus: ctx.result.transition.fromStatus,
+            toStatus: ctx.result.transition.toStatus,
+            replayed: ctx.result.replayed,
+            transitionId: ctx.result.transition.transitionId,
+          },
+        });
+      },
+      respond: (ctx) =>
+        jsonResponse(200, serializeWorkflowInstanceTransitionOutcome(ctx.result)),
     }),
   );
 }

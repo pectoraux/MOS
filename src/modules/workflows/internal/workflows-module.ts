@@ -1,17 +1,30 @@
 /**
  * /workflows module implementation (MKT-008 — the Workflow DEFINITION
- * sub-authority of the frozen "Workflow definition + instance state"
- * authority, spec/implementation-contract.md §1).
+ * sub-authority; MKT-009 — the Workflow INSTANCE sub-authority of the
+ * frozen "Workflow definition + instance state" authority,
+ * spec/implementation-contract.md §1/§5).
  *
- * Owns the workflows + workflow_definitions tables: Workflow identity and
- * the Workspace-scoped ownership relation (scope chain Agency → Client →
- * Workspace → Workflow, with Client/Agency ownership SERVER-DERIVED from
- * the canonical /workspaces owner resolution), the versioned typed graph
- * definitions with their schemas and declarative policy blocks, the frozen
- * definition lifecycle (draft → review → active → retired, immutable after
- * activation) and the canonical owner resolution every workflow-scoped
- * operation must pass through (implementation-contract §2: "Authorization
- * MUST resolve the canonical owner before dependent traversal").
+ * Owns the workflows + workflow_definitions tables (MKT-008): Workflow
+ * identity and the Workspace-scoped ownership relation (scope chain
+ * Agency → Client → Workspace → Workflow, with Client/Agency ownership
+ * SERVER-DERIVED from the canonical /workspaces owner resolution), the
+ * versioned typed graph definitions with their schemas and declarative
+ * policy blocks, the frozen definition lifecycle (draft → review → active
+ * → retired, immutable after activation) and the canonical owner
+ * resolution every workflow-scoped operation must pass through
+ * (implementation-contract §2: "Authorization MUST resolve the canonical
+ * owner before dependent traversal").
+ *
+ * MKT-009 adds the workflow_instances + workflow_instance_transitions
+ * tables: the Workflow INSTANCE lifecycle identity (pinning one immutable
+ * ACTIVE definition version through the EXPLICIT workflow_definition_id
+ * reference) and the FROZEN §5 state machine (draft → ready → running with
+ * paused/blocked returns; succeeded/failed/cancelled terminal and
+ * immutable). transitionWorkflowInstance is the ONE authorized mutation
+ * port for instance state (§5 "only /workflows may mutate
+ * workflow-instance state"): idempotency-fenced (duplicate requests
+ * converge to the recorded transition), CAS-guarded, transition-guarded
+ * and recorded as append-only history.
  *
  * Graph validation is THE authority here: every create and every content
  * update runs the exhaustive typed-graph validation (the frozen §4 MUST
@@ -22,31 +35,48 @@
  * through /playbooks' EXPLICIT version reference (unknown, foreign or
  * Client-incompatible versions are uniformly unresolvable).
  *
- * This module introduces NO runtime authority: no workflow-instance state
- * machine, no run/task/execution lifecycle, no retry orchestration, no
- * deployment binding (architecture.md §10/§11 — the instance machine is
- * MKT-009's extension of this module; Executions are /executions,
- * MKT-010; deployment binding is /deployments, MKT-040). Agency/
- * membership authorization stays in /agencies (dependency matrix:
- * /workflows ──→ /workspaces, /playbooks for MKT-008); this module
- * composes Workflow ownership WITH that authority — it never invents a
- * second one.
+ * This module introduces NO execution authority even after MKT-009: the
+ * instance state machine records LIFECYCLE STATE ONLY — there is no
+ * run/task/execution lifecycle, no node-instance bookkeeping, no retry
+ * orchestration, no deployment binding here (architecture.md §10/§11 —
+ * Executions are /executions, MKT-010; deployment binding is
+ * /deployments, MKT-040). Agency/membership authorization stays in
+ * /agencies (dependency matrix: /workflows ──→ /workspaces, /playbooks
+ * for MKT-008/009); this module composes Workflow ownership WITH that
+ * authority — it never invents a second one.
  *
  * Concurrency (MKT-008): definition version-number assignment is
  * serialized by the workflow row lock; content/lifecycle mutations are
  * row-locked CAS transactions with deterministic conflict behavior.
- * Authorization derives from durable state on every call — no
- * process-local cache authority.
+ * Concurrency (MKT-009): every instance transition (and every replay)
+ * serializes on the instance row lock; the (instance, idempotency_key)
+ * UNIQUE fence on the append-only history is the storage end of §5
+ * "duplicate transition requests are idempotent". Authorization derives
+ * from durable state on every call — no process-local cache authority.
  */
 
 import { ConflictError, InvalidRequestError, NotFoundError } from '../../../platform/errors/errors.ts';
-import type { WorkflowsModuleApi, WorkflowsModuleDeps } from '../public.ts';
-import { composeWorkflowOwnerContext, isLegalWorkflowDefinitionTransition } from '../public.ts';
+import type { DbTransaction } from '../../../platform/db/contract.ts';
+import type {
+  WorkflowInstanceStatus,
+  WorkflowInstanceTransitionOutcome,
+  WorkflowInstanceTransitionRecord,
+  WorkflowsModuleApi,
+  WorkflowsModuleDeps,
+} from '../public.ts';
+import {
+  composeWorkflowOwnerContext,
+  isLegalWorkflowDefinitionTransition,
+  isLegalWorkflowInstanceTransition,
+  isTerminalWorkflowInstanceStatus,
+} from '../public.ts';
 import { validateWorkflowDefinitionContent } from './workflow-graph.ts';
+import { WorkflowInstancesStore } from './workflow-instances-store.ts';
 import { WorkflowsStore } from './workflows-store.ts';
 
 export function createWorkflowsModule(deps: WorkflowsModuleDeps): WorkflowsModuleApi {
   const store = new WorkflowsStore(deps.db, deps.clock, deps.ids);
+  const instances = new WorkflowInstancesStore(deps.db, deps.clock, deps.ids);
   const { workspaces, playbooks } = deps;
 
   return {
@@ -316,7 +346,203 @@ export function createWorkflowsModule(deps: WorkflowsModuleDeps): WorkflowsModul
         return updated;
       });
     },
+
+    async createWorkflowInstance(input) {
+      // The owning Workflow must resolve from durable state (404 otherwise)
+      // — a caller-supplied Workflow UUID is never an authorization.
+      const workflow = await store.getWorkflow(input.workflowId);
+      if (workflow === null) {
+        throw new NotFoundError('workflow', input.workflowId);
+      }
+
+      return deps.db.transaction(async (tx) => {
+        // Policy: instantiation is NEW USE — the owning Workspace, its
+        // Client and the owning Agency must all be live and ACTIVE (a
+        // tombstoned boundary surfaces as the uniform 404 of the workflow
+        // itself; a disabled boundary blocks new use without rewriting
+        // history). Resolved FRESH here inside the transaction.
+        await assertBoundariesAllowNewUse(deps, workflow);
+
+        // The EXPLICIT version reference: the pinned definition is resolved
+        // under its row lock (activation/retirement cannot race the pin),
+        // must belong to THIS workflow (a foreign definition id is
+        // indistinguishable from an unknown one — uniform 404, never a
+        // traversal/existence oracle) and must be ACTIVE: an activated
+        // definition is content-immutable forever (retirement preserves
+        // content byte for byte), so the instance's pin can never float.
+        // Draft/review definitions are still CAS-editable and retired
+        // definitions record ended versions — neither can be instantiated.
+        const definition = await store.lockWorkflowDefinition(tx, input.workflowDefinitionId);
+        if (definition === null || definition.workflowId !== input.workflowId) {
+          throw new NotFoundError('workflow definition', input.workflowDefinitionId);
+        }
+        if (definition.status !== 'active') {
+          throw new ConflictError(
+            `workflow definition ${input.workflowDefinitionId} is ${definition.status}; instances can only be created from active definitions (the pinned version must be immutable)`,
+          );
+        }
+
+        // Scope is SERVER-DERIVED from the durable workflow row (itself
+        // DB-backstopped to the canonical Workspace/Client/Agency chain) —
+        // never caller inputs.
+        return instances.insertWorkflowInstance(tx, {
+          workflowId: workflow.workflowId,
+          workflowDefinitionId: definition.workflowDefinitionId,
+          workspaceId: workflow.workspaceId,
+          clientId: workflow.clientId,
+          agencyId: workflow.agencyId,
+          actorId: input.actorId,
+        });
+      });
+    },
+
+    async getWorkflowInstance(instanceId) {
+      return instances.getWorkflowInstance(instanceId);
+    },
+
+    async listWorkflowInstances(workflowId) {
+      // Canonical owner resolution before dependent traversal (§2).
+      const workflow = await store.getWorkflow(workflowId);
+      if (workflow === null) {
+        throw new NotFoundError('workflow', workflowId);
+      }
+      const ownership = await workspaces.resolveWorkspaceOwnership(workflow.workspaceId);
+      if (ownership === null) {
+        throw new NotFoundError('workflow', workflowId);
+      }
+      return instances.listWorkflowInstances(workflowId);
+    },
+
+    async getWorkflowInstanceTransitions(instanceId) {
+      return instances.listWorkflowInstanceTransitions(instanceId);
+    },
+
+    async transitionWorkflowInstance(input) {
+      return deps.db.transaction(async (tx) => {
+        // THE SERIALIZATION POINT: every transition (and every replay) on
+        // this instance takes the instance row lock first — concurrent
+        // requests on the SAME instance resolve in a deterministic order.
+        const current = await instances.lockWorkflowInstance(tx, input.instanceId);
+        if (current === null) {
+          throw new NotFoundError('workflow instance', input.instanceId);
+        }
+
+        // (1) IDEMPOTENCE FIRST — before CAS: a request key that already
+        // has a recorded transition CONVERGES to that outcome. The CAS
+        // token is deliberately NOT re-checked on the replay path: at-least
+        // once delivery of the same logical command must converge, never
+        // fail. A key reused with a DIFFERENT target state is a conflict —
+        // one key identifies exactly one logical command.
+        const recorded = await instances.findTransitionByKey(
+          tx,
+          input.instanceId,
+          input.idempotencyKey,
+        );
+        if (recorded !== null) {
+          return replayOutcome(tx, instances, recorded, input);
+        }
+
+        // (2) CAS: the presented token must match the locked row.
+        if (current.version !== input.expectedVersion) {
+          throw new ConflictError(
+            `workflow instance version mismatch: current version is ${current.version}`,
+          );
+        }
+
+        // (3) TRANSITION GUARD: (current → to) must be a frozen §5 edge.
+        // Terminal states reject everything ("terminal states are
+        // immutable"), and the DB trigger is the final backstop.
+        if (!isLegalWorkflowInstanceTransition(current.status, input.to)) {
+          if (isTerminalWorkflowInstanceStatus(current.status)) {
+            throw new ConflictError(
+              `workflow instance ${input.instanceId} is ${current.status} (terminal) and frozen; terminal states are immutable`,
+            );
+          }
+          throw new ConflictError(
+            `illegal workflow instance transition ${current.status} → ${input.to}`,
+          );
+        }
+
+        // (4) BOUNDARY POLICY: entering RUNNING is NEW USE — the owning
+        // boundaries must be live and ACTIVE. Editorial staging
+        // (draft → ready), control recording (running → paused/blocked)
+        // and terminal recording (succeeded/failed/cancelled) stay
+        // available regardless of boundary state: history keeps being
+        // recordable, and cancellation must never be blocked by a disabled
+        // boundary.
+        if (input.to === 'running') {
+          await assertBoundariesAllowNewUse(deps, current);
+        }
+
+        // (5) RECORD THE TRANSITION FIRST (append-only, idempotency-fenced):
+        // if the fence fires here the same key was recorded outside the row
+        // lock (direct SQL backstop path) — converge exactly like a replay.
+        const inserted = await instances.insertWorkflowInstanceTransition(tx, {
+          instanceId: input.instanceId,
+          idempotencyKey: input.idempotencyKey,
+          fromStatus: current.status,
+          toStatus: input.to,
+          reason: input.reason ?? '',
+          actorId: input.actorId,
+        });
+        if (inserted === 'fenced') {
+          const fencedRecord = await instances.findTransitionByKey(
+            tx,
+            input.instanceId,
+            input.idempotencyKey,
+          );
+          if (fencedRecord === null) {
+            throw new Error(
+              `idempotency fence fired for workflow instance ${input.instanceId} key ${input.idempotencyKey} but no recorded transition could be read back`,
+            );
+          }
+          return replayOutcome(tx, instances, fencedRecord, input);
+        }
+
+        // (6) APPLY: CAS status update under the held row lock (the CAS
+        // cannot lose here — the row is locked and the token was verified
+        // against the locked read; the frozen-§5 DB trigger backstops).
+        const outcome = await instances.updateWorkflowInstanceStatusRow(tx, {
+          instanceId: input.instanceId,
+          status: input.to,
+          expectedVersion: input.expectedVersion,
+        });
+        if (outcome !== 'ok') {
+          throw new ConflictError('workflow instance transition lost the version race');
+        }
+        const updated = await instances.rereadWorkflowInstance(tx, input.instanceId);
+        if (updated === null) {
+          throw new Error(`updated workflow instance ${input.instanceId} could not be read back`);
+        }
+        return { instance: updated, transition: inserted, replayed: false };
+      });
+    },
   };
+}
+
+/**
+ * The replay-convergence path: the recorded transition is the outcome the
+ * duplicate request converges to; the returned instance is the CURRENT
+ * durable record (re-read through the locked transaction — the instance may
+ * legitimately have moved on since the recorded transition). A key reused
+ * with a different target state is a ConflictError.
+ */
+async function replayOutcome(
+  tx: DbTransaction,
+  instances: WorkflowInstancesStore,
+  recorded: WorkflowInstanceTransitionRecord,
+  input: { instanceId: string; to: WorkflowInstanceStatus },
+): Promise<WorkflowInstanceTransitionOutcome> {
+  if (recorded.toStatus !== input.to) {
+    throw new ConflictError(
+      `idempotency key is already recorded as transition ${recorded.fromStatus} → ${recorded.toStatus} on workflow instance ${input.instanceId}; one key identifies one logical command`,
+    );
+  }
+  const current = await instances.rereadWorkflowInstance(tx, input.instanceId);
+  if (current === null) {
+    throw new Error(`workflow instance ${input.instanceId} could not be read back`);
+  }
+  return { instance: current, transition: recorded, replayed: true };
 }
 
 /**
