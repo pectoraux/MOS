@@ -46,7 +46,13 @@
  *      machine pairs can be recorded, every transition INTO failed
  *      declares its §24 retry classification and the reconciliation
  *      evidence reference appears only on reconciling → succeeded |
- *      failed | unknown rows;
+ *      failed | unknown rows — AND the history trigger carries the
+ *      applied-transition integrity backstop of the MKT-010 audit
+ *      erratum (spec/errata/MKT-010-history-ledger.md): it resolves the
+ *      target execution row with a concurrency-safe SELECT … FOR UPDATE
+ *      and rejects any history row whose from_status does not equal the
+ *      execution's durable current status (a fabricated applied
+ *      transition cannot be recorded, even by direct SQL);
  *   6. the identity/linkage/kind/runtime-class/scope IMMUTABILITY trigger
  *      exists with the SET-ONCE retry-classification rule, and the
  *      scope-chain trigger backstops both boundary hops;
@@ -334,6 +340,32 @@ test('the DB backstops terminal immutability, the §8 fences and the append-only
   assert.ok(
     migration011.includes('execution_transitions_legal'),
     'an illegal pair cannot even be recorded as history',
+  );
+  // APPLIED-TRANSITION INTEGRITY BACKSTOP (the MKT-010 audit erratum,
+  // spec/errata/MKT-010-history-ledger.md): the history trigger must
+  // resolve the target execution's durable status — concurrency-safely
+  // (FOR UPDATE, sharing the authorized transition path's row lock) — and
+  // reject any history row whose from_status does not equal it. Without
+  // this backstop a syntactically legal transition can be fabricated into
+  // the ledger against a from_status the execution never had.
+  const historyTrigger = migration011.slice(
+    migration011.indexOf('CREATE OR REPLACE FUNCTION execution_transitions_legal'),
+    migration011.indexOf('DROP TRIGGER IF EXISTS execution_transitions_legal_trigger'),
+  );
+  assert.ok(historyTrigger.length > 0, 'the execution_transitions_legal trigger function exists');
+  assert.ok(
+    /FROM\s+executions\s+WHERE\s+execution_id\s*=\s*NEW\.execution_id\s+FOR\s+UPDATE/.test(
+      historyTrigger,
+    ),
+    'the history trigger resolves the target execution row with a concurrency-safe FOR UPDATE',
+  );
+  assert.ok(
+    historyTrigger.includes('v_current_status <> NEW.from_status'),
+    'the history trigger compares the durable status against the recorded from_status',
+  );
+  assert.ok(
+    historyTrigger.includes('fabricated applied transition rejected'),
+    'a history row whose from_status does not equal the durable status is rejected',
   );
   // §24 payload contracts at the storage layer.
   assert.ok(

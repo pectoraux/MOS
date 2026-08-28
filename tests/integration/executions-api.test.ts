@@ -44,6 +44,15 @@
  *     linkage/kind/runtime/scope immutability, the set-once retry
  *     classification, the append-only history, the lease one-active
  *     fences and the lease eligibility trigger all reject direct SQL;
+ *   - APPLIED-TRANSITION HISTORY INTEGRITY (the MKT-010 audit erratum,
+ *     spec/errata/MKT-010-history-ledger.md): a history row is the record
+ *     of a transition that WAS applied — its from_status must equal the
+ *     execution's durable current status at record time. A direct-SQL
+ *     insert of a legal-looking pair against a stale from_status
+ *     (fabricated applied transition) is rejected by the database; the
+ *     predicate is consistency, not a writer ban (a matching from_status
+ *     records fine); the NORMAL application transition still succeeds
+ *     under the same trigger; history stays append-only;
  *   - cross-tenant posture: a foreign-agency member sees the same 404s as
  *     for unknown identifiers on every execution route (no
  *     traversal/existence oracle); a foreign lease id is a uniform 404
@@ -1663,6 +1672,140 @@ test('database backstops: direct SQL cannot cross the frozen machine, the identi
     await assert.rejects(
       db.query(`UPDATE executions SET status = 'succeeded' WHERE execution_id = $1`, [executionId]),
     );
+  } finally {
+    await db.close();
+  }
+});
+
+test('applied-transition history integrity: fabricated history with a stale from_status is DB-rejected while the normal path still records (MKT-010 audit erratum)', async () => {
+  // (1) Advance an execution to a NON-INITIAL durable state (running) —
+  // the prerequisite of the erratum attack.
+  const created = await createExecution(
+    {
+      workflowInstanceId: REFERENCE_INSTANCE,
+      nodeId: 'ledger-integrity-node',
+      executionKind: 'ai',
+      runtimeClass: 'ephemeral-sandbox',
+      idempotencyKey: 'ledger-integrity-1',
+    },
+    owner.token,
+  );
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const executionId = (created.body['execution'] as Record<string, unknown>)['executionId'] as string;
+  const version = await driveToRunning(executionId, owner.token, 'ledger-integrity');
+
+  const db = new PgDb(stack!.env.databaseUrl, 2);
+  try {
+    // (2)+(3) THE ERRATUM ATTACK: the execution is durably RUNNING, and
+    // `created → queued` is a LEGAL frozen-machine edge — but the
+    // execution never made that transition from this state. The
+    // syntactically legal pair must still be REJECTED: history.from_status
+    // must equal the execution's durable status.
+    await assert.rejects(
+      db.query(
+        `INSERT INTO execution_transitions (transition_id, execution_id, idempotency_key,
+                                            from_status, to_status, reason)
+         VALUES ($1, $2, 'ledger-fabricated-1', 'created', 'queued', 'fabricated applied transition')`,
+        ['00000000-0000-4000-8000-000000000c01', executionId],
+      ),
+      /fabricated applied transition rejected.*claims from_status created/,
+    );
+    // The same attack through a different stale intermediate state:
+    // `queued → starting` is a legal edge, but the durable status is
+    // running — rejected with the actual durable status named.
+    await assert.rejects(
+      db.query(
+        `INSERT INTO execution_transitions (transition_id, execution_id, idempotency_key,
+                                            from_status, to_status, reason)
+         VALUES ($1, $2, 'ledger-fabricated-2', 'queued', 'starting', 'fabricated applied transition')`,
+        ['00000000-0000-4000-8000-000000000c02', executionId],
+      ),
+      /fabricated applied transition rejected.*is durably running/,
+    );
+    // A history row for an unknown execution is rejected as well (the
+    // trigger resolves the execution row; there is nothing to match).
+    await assert.rejects(
+      db.query(
+        `INSERT INTO execution_transitions (transition_id, execution_id, idempotency_key,
+                                            from_status, to_status, reason)
+         VALUES ($1, $2, 'ledger-fabricated-3', 'created', 'queued', 'fabricated applied transition')`,
+        ['00000000-0000-4000-8000-000000000c03', '00000000-0000-4000-8000-000000000c99'],
+      ),
+      /unknown execution/,
+    );
+    // The fabricated rows were never recorded — the ledger still holds
+    // exactly the three applied transitions of the drive to running.
+    const afterAttacks = await db.query<{ from_status: string; to_status: string }>(
+      `SELECT from_status, to_status FROM execution_transitions WHERE execution_id = $1`,
+      [executionId],
+    );
+    assert.equal(afterAttacks.rowCount, 3);
+
+    // The predicate is CONSISTENCY, not a blanket direct-SQL ban: a row
+    // whose from_status EQUALS the durable status records fine (the
+    // database enforces exactly the erratum predicate — never more — the
+    // same posture as the row-level machine backstop above).
+    const consistent = await db.query(
+      `INSERT INTO execution_transitions (transition_id, execution_id, idempotency_key,
+                                            from_status, to_status, reason)
+       VALUES ($1, $2, 'ledger-consistent-1', 'running', 'unknown', 'consistent recording')`,
+      ['00000000-0000-4000-8000-000000000c04', executionId],
+    );
+    assert.equal(consistent.rowCount, 1);
+
+    // History remains append-only under the corrected trigger.
+    await assert.rejects(
+      db.query(`UPDATE execution_transitions SET reason = 'rewritten' WHERE execution_id = $1`, [executionId]),
+    );
+    await assert.rejects(
+      db.query(`DELETE FROM execution_transitions WHERE execution_id = $1`, [executionId]),
+    );
+
+    // (4) The NORMAL application transition still succeeds: the authorized
+    // path records history under the execution row lock it already holds
+    // (the trigger's FOR UPDATE shares that lock — no second authority),
+    // and its from_status equals the locked row's durable status.
+    const pausing = await transitionExecution(
+      executionId,
+      { to: 'pausing', version, idempotencyKey: 'ledger-integrity:pausing' },
+      owner.token,
+    );
+    assert.equal(pausing.status, 200, JSON.stringify(pausing.body));
+    assert.equal(pausing.body['replayed'], false);
+    const paused = await transitionExecution(
+      executionId,
+      {
+        to: 'paused',
+        version: (pausing.body['execution'] as Record<string, unknown>)['version'] as number,
+        idempotencyKey: 'ledger-integrity:paused',
+      },
+      owner.token,
+    );
+    assert.equal(paused.status, 200, JSON.stringify(paused.body));
+    const pausedExecution = paused.body['execution'] as Record<string, unknown>;
+    assert.equal(pausedExecution['status'], 'paused');
+
+    // The final ledger holds exactly the APPLIED transitions plus the one
+    // consistent direct-SQL recording — and NOTHING fabricated: six rows,
+    // each of whose from_status matched the durable status at its record
+    // time (created→queued, queued→starting, starting→running,
+    // running→unknown (direct SQL), running→pausing, pausing→paused).
+    const ledger = await db.query<{ from_status: string; to_status: string }>(
+      `SELECT from_status, to_status FROM execution_transitions WHERE execution_id = $1`,
+      [executionId],
+    );
+    assert.equal(ledger.rowCount, 6);
+    const pairs = ledger.rows
+      .map((row) => `${row.from_status}→${row.to_status}`)
+      .sort();
+    assert.deepEqual(pairs, [
+      'created→queued',
+      'pausing→paused',
+      'queued→starting',
+      'running→pausing',
+      'running→unknown',
+      'starting→running',
+    ]);
   } finally {
     await db.close();
   }

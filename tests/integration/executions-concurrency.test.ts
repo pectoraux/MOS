@@ -23,7 +23,15 @@
  *   7. concurrent lease acquisition on ONE sandbox: exactly ONE permitted
  *      controller wins, every other execution's attempt is a 409;
  *   8. concurrent release + release-replay: the lease is released EXACTLY
- *      ONCE (one version bump) and both responses converge.
+ *      ONCE (one version bump) and both responses converge;
+ *   9. the applied-transition integrity check is CONCURRENCY-SAFE (the
+ *      MKT-010 audit erratum, spec/errata/MKT-010-history-ledger.md): a
+ *      fabricated history insert that races the authorized transition's
+ *      held row lock serializes BEHIND it and is judged against the
+ *      post-commit durable status — a stale from_status can never slip
+ *      through on a pre-commit snapshot (no TOCTOU); the authorized
+ *      path's own history recording under its held lock stays
+ *      non-blocking (the trigger's FOR UPDATE shares that lock).
  */
 
 import { test, before, after } from 'node:test';
@@ -447,4 +455,103 @@ test('concurrent lease acquisition on ONE sandbox: exactly ONE permitted control
   assert.equal(releasedRead.status, 200);
   assert.equal(releasedRead.body['replayed'], true);
   assert.equal((releasedRead.body['lease'] as Record<string, unknown>)['version'], 2);
+});
+
+test('a racing fabricated history insert serializes behind the held row lock and is judged against the post-commit status (no TOCTOU)', async () => {
+  // One execution, driven to running through the authorized API path.
+  const created = await createExecution({
+    workflowInstanceId: '22222222-3333-4444-8555-666666666666',
+    nodeId: 'ledger-race-node',
+    executionKind: 'deterministic',
+    runtimeClass: 'pooled-worker',
+    idempotencyKey: 'ledger-race-1',
+  });
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const executionId = (created.body['execution'] as Record<string, unknown>)['executionId'] as string;
+  await driveToRunning(executionId, 'ledger-race');
+
+  const db = new PgDb(stack!.env.databaseUrl, 2);
+  try {
+    // The racing fabricated insert's outcome is captured (never an
+    // unhandled floating rejection while the authorized transaction is
+    // still open).
+    let racingError: unknown = null;
+    let racingSucceeded = false;
+    let racingInsert: Promise<void> | null = null;
+
+    // The authorized-path apply phase, held open: the execution row is
+    // locked at RUNNING inside an uncommitted transaction (the same
+    // lock → record → apply → commit ordering the API path uses).
+    await db.transaction(async (tx) => {
+      const locked = await tx.query<{ status: string }>(
+        `SELECT status FROM executions WHERE execution_id = $1 FOR UPDATE`,
+        [executionId],
+      );
+      assert.equal(locked.rows[0]!.status, 'running');
+
+      // While the row lock is HELD, the fabricated history insert arrives
+      // — a stale-but-legal pair (running → unknown, legal edge, and
+      // from_status matches the CURRENT durable status). The trigger-side
+      // FOR UPDATE must serialize this insert BEHIND the held lock: it
+      // cannot read a pre-commit snapshot.
+      racingInsert = db
+        .query(
+          `INSERT INTO execution_transitions (transition_id, execution_id, idempotency_key,
+                                              from_status, to_status, reason)
+           VALUES ($1, $2, 'ledger-race-fabricated', 'running', 'unknown', 'racing fabricated history')`,
+          ['00000000-0000-4000-8000-000000000d01', executionId],
+        )
+        .then(
+          () => {
+            racingSucceeded = true;
+          },
+          (error: unknown) => {
+            racingError = error;
+          },
+        );
+
+      // The authorized transaction applies running → pausing and commits
+      // while the racing insert is still queued behind the row lock.
+      const applied = await tx.query(
+        `UPDATE executions SET status = 'pausing', version = version + 1
+          WHERE execution_id = $1 AND status = 'running'`,
+        [executionId],
+      );
+      assert.equal(applied.rowCount, 1);
+    });
+    await racingInsert!;
+
+    // The racing insert unblocked against the POST-COMMIT durable status
+    // (pausing): its stale from_status (running) is rejected. WITHOUT the
+    // FOR UPDATE this insert would have read the pre-commit running status
+    // and slipped through — exactly the TOCTOU the erratum's
+    // concurrency-safety requirement rules out.
+    assert.equal(racingSucceeded, false, 'the racing fabricated insert must not be recorded');
+    assert.ok(racingError instanceof Error, `expected a rejection, got ${String(racingError)}`);
+    assert.match(
+      racingError.message,
+      /fabricated applied transition rejected.*is durably pausing.*claims from_status running/,
+    );
+
+    // The ledger still holds exactly the three applied transitions of the
+    // drive to running — the racing fabricated row was never recorded.
+    const rows = await db.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM execution_transitions WHERE execution_id = $1`,
+      [executionId],
+    );
+    assert.equal(rows.rows[0]!.count, '3');
+
+    // And the authorized path itself remains fully usable under the
+    // corrected trigger: the next API transition records normally (the
+    // trigger's FOR UPDATE shares the path's own row lock — non-blocking,
+    // no deadlock: pausing → paused succeeds).
+    const paused = await transitionExecution(executionId, {
+      to: 'paused',
+      version: 5,
+      idempotencyKey: 'ledger-race:paused',
+    });
+    assert.equal(paused.status, 200, JSON.stringify(paused.body));
+  } finally {
+    await db.close();
+  }
 });

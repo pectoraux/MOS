@@ -48,7 +48,13 @@
 --     INTO failed MUST declare its retry classification (§24: "Retryable
 --     failures must declare whether retry is safe"); reconciliation decisions
 --     (from reconciling) may carry an authoritative external-evidence
---     reference;
+--     reference. A recorded transition is the record of a decision that WAS
+--     APPLIED: the history trigger resolves the execution row (FOR UPDATE —
+--     concurrency-safe, sharing the authorized transition path's row lock)
+--     and rejects any history row whose from_status does not equal the
+--     execution's durable current status — a fabricated-but-legal applied
+--     transition cannot be recorded even by direct SQL (the MKT-010 audit
+--     erratum, spec/errata/MKT-010-history-ledger.md);
 --   * §8 idempotency: every execution create carries a LOGICAL idempotency
 --     key, and the DATABASE enforces its uniqueness — (workspace_id,
 --     idempotency_key) UNIQUE. "Application-level check-then-insert is
@@ -382,11 +388,42 @@ CREATE TRIGGER executions_scope_chain_trigger
 -- payload contracts hold at the storage layer: every transition INTO failed
 -- declares its retry classification; the reconciliation-decision evidence
 -- reference appears only on reconciling → succeeded/failed/unknown rows.
+--
+-- APPLIED-TRANSITION INTEGRITY (the MKT-010 audit erratum,
+-- spec/errata/MKT-010-history-ledger.md): a history row records a transition
+-- that WAS applied to the execution — its from_status must equal the
+-- execution row's durable current status at record time. The execution row
+-- is resolved with SELECT ... FOR UPDATE, so the check is concurrency-safe
+-- and shares the authorized transition path's row lock (that path locks the
+-- execution row BEFORE recording history and applies the status change in
+-- the same transaction) — the trigger adds no second authority. A direct-SQL
+-- writer can therefore no longer fabricate a legal-looking applied
+-- transition against a stale from_status (e.g. recording created → queued
+-- while the execution is durably running).
 CREATE OR REPLACE FUNCTION execution_transitions_legal() RETURNS trigger AS $$
+DECLARE
+    v_current_status text;
 BEGIN
     IF NOT execution_transition_legal(NEW.from_status, NEW.to_status) THEN
         RAISE EXCEPTION 'illegal execution transition % → % cannot be recorded',
             NEW.from_status, NEW.to_status;
+    END IF;
+    -- The from_status of a recorded transition must equal the execution's
+    -- durable current status: history records what WAS applied, never a
+    -- fabricated transition. FOR UPDATE = concurrency-safe (the authorized
+    -- writer already holds this row lock; a racing writer serializes
+    -- against the same serialization point the transition path uses).
+    SELECT status INTO v_current_status
+      FROM executions
+     WHERE execution_id = NEW.execution_id
+       FOR UPDATE;
+    IF v_current_status IS NULL THEN
+        RAISE EXCEPTION 'cannot record a transition for unknown execution %',
+            NEW.execution_id;
+    END IF;
+    IF v_current_status <> NEW.from_status THEN
+        RAISE EXCEPTION 'fabricated applied transition rejected: execution % is durably % but the history row claims from_status % — history must record the transition that was actually applied',
+            NEW.execution_id, v_current_status, NEW.from_status;
     END IF;
     IF NEW.to_status = 'failed' AND NEW.retry_classification IS NULL THEN
         RAISE EXCEPTION 'transition INTO failed must declare retry classification (safe | unsafe) on execution % — retryable failures must declare whether retry is safe',
